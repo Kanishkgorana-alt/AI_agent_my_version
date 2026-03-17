@@ -1,21 +1,23 @@
 import os
-from groq import Groq
-
-import streamlit as st
-import numpy as np
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
-import pandas as pd
 import pickle
 
-# Initialize Groq clientfrom groq import Groq
+from groq import Groq
+import pandas as pd
+import streamlit as st
+import tensorflow as tf
 
-client = Groq(api_key="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")
+groq_api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 # ------------------------------
 # AI Strategy Generator
 # ------------------------------
 def generate_strategy(customer_data, risk, prob):
+    if client is None:
+        return (
+            "Set the GROQ_API_KEY environment variable to enable AI-generated "
+            "retention strategies."
+        )
 
     prompt = f"""
 You are a banking customer retention expert.

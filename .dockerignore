@@ -1,0 +1,12 @@
+.git
+.gitignore
+.gitattributes
+.devcontainer/
+.ipynb_checkpoints/
+anaconda_projects/
+logs/
+__pycache__/
+*.py[cod]
+*.ipynb
+app-Copy1.py
+Churn_Modelling.csv
