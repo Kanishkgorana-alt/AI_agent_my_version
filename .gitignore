@@ -1,1 +1,7 @@
 .env
+.codex-home/
+.venv312/
+
+__pycache__/
+logs/
+*.log

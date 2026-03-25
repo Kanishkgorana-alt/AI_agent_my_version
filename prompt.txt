@@ -1,0 +1,181 @@
+You are working inside an existing AI project that implements a LEARNING AGENT for a Bank Customer Retention System.
+
+This is NOT a simple chatbot. It is a structured AI agent based on the classical AI architecture:
+Performance Element + Learning Element + Critic + Problem Generator.
+
+Your task is to understand the project, reuse existing components, and build an integrated agent system.
+
+-----------------------------
+PROJECT GOAL
+-----------------------------
+Build an intelligent bank assistant that:
+- Analyzes customer data
+- Predicts churn probability
+- Suggests personalized retention strategies
+- Improves over time using feedback (learning agent)
+
+-----------------------------
+AVAILABLE DATA (already in project or expected)
+-----------------------------
+Each customer may have:
+- account_number
+- account_type
+- bank_balance
+- loan_amount
+- credit_card
+- offers_given (list)
+- income_details
+- property/wealth
+- dependents
+- transaction_history (multiple entries)
+- feedback_history (multiple entries)
+- geography
+
+Data may be stored in:
+- CSV / SQLite / Firebase / JSON
+
+-----------------------------
+CORE COMPONENTS (IMPORTANT)
+-----------------------------
+
+1. PERFORMANCE ELEMENT (Agent Brain)
+- Takes input: customer_id or query
+- Calls tools:
+    - fetch customer data
+    - fetch transactions
+    - run churn prediction
+- Produces:
+    - churn risk
+    - insights
+    - recommended actions
+
+Use LangChain agent (latest syntax preferred: LCEL / Runnable / tools)
+
+-----------------------------
+
+2. LEARNING ELEMENT
+- Improves system over time
+- Updates based on:
+    - customer feedback
+    - success/failure of offers
+- Can:
+    - store interaction logs
+    - update rules or weights
+    - optionally retrain churn model (future scope)
+
+-----------------------------
+
+3. CRITIC
+- Evaluates output quality
+- Example:
+    - Did customer accept offer?
+    - Did churn reduce?
+- Produces feedback signal:
+    success / failure / score
+
+-----------------------------
+
+4. PROBLEM GENERATOR
+- Suggests exploratory actions
+- Example:
+    - Try new type of offer
+    - Try different retention strategy
+- Encourages learning instead of static behavior
+
+-----------------------------
+
+CHURN MODEL (IMPORTANT)
+-----------------------------
+- Already built by teammate (NN model or pickle)
+- You must:
+    - locate and load it
+    - wrap it as:
+        predict_churn(features) -> probability
+
+This is a KEY component of decision-making.
+
+-----------------------------
+LANGCHAIN INTEGRATION
+-----------------------------
+You MUST:
+
+Create tools:
+- get_customer_data
+- get_transactions
+- predict_churn_tool
+- generate_retention_strategy
+
+Build agent:
+- Tool-calling agent (ReAct or Runnable)
+- Input: customer_id or natural query
+- Output structured JSON
+
+-----------------------------
+EXPECTED OUTPUT FORMAT
+-----------------------------
+{
+  "customer_id": "...",
+  "churn_risk": 0.0-1.0,
+  "risk_level": "low | medium | high",
+  "insights": [
+    "low balance trend",
+    "high withdrawals",
+    ...
+  ],
+  "recommended_actions": [
+    "offer cashback",
+    "reduce loan interest",
+    ...
+  ]
+}
+
+-----------------------------
+INTEGRATION REQUIREMENTS
+-----------------------------
+- DO NOT create duplicate files
+- Reuse existing:
+    - database connections
+    - model files
+    - backend (FastAPI if exists)
+- Keep code modular
+
+-----------------------------
+OPTIONAL (IF PROJECT SUPPORTS)
+-----------------------------
+- Add API endpoint:
+    POST /analyze_customer
+- Add logging for learning element
+- Store feedback for critic
+
+-----------------------------
+STEP-BY-STEP EXECUTION
+-----------------------------
+1. Scan project and explain structure
+2. Identify reusable components
+3. Implement missing modules only
+4. Integrate churn model
+5. Build LangChain tools
+6. Build agent
+7. Connect learning + critic (basic version)
+8. Show:
+    - file changes
+    - how to run
+    - example usage
+
+-----------------------------
+IMPORTANT RULES
+-----------------------------
+- Do NOT overwrite unrelated code
+- Keep everything compatible
+- Prefer simple working solution over complex incomplete one
+- Use clear function boundaries
+- Avoid hardcoding paths
+
+-----------------------------
+FINAL OBJECTIVE
+-----------------------------
+Deliver a working prototype of a LEARNING AGENT for bank customer retention that:
+- Uses data
+- Uses churn prediction
+- Makes decisions
+- Can improve over time

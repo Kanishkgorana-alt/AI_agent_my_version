@@ -9,4 +9,5 @@ __pycache__/
 *.py[cod]
 *.ipynb
 app-Copy1.py
-Churn_Modelling.csv
+.env
+.venv312/

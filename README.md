@@ -1,6 +1,6 @@
 # Customer Churn Prediction using Artificial Neural Networks (ANN)
 
-This project builds an end-to-end machine learning pipeline to predict whether a bank customer is likely to **churn (exit)**.  
+This project builds an end-to-end machine learning pipeline to predict whether a bank customer is likely to **churn (exit)**.
 It covers data cleaning, feature engineering, model training, evaluation, and deployment through an interactive Streamlit application.
 
 ---
@@ -22,16 +22,16 @@ This project demonstrates:
 
 Each record represents a customer with features such as:
 
-- Geography, Gender  
-- Age, Tenure  
-- Balance, Estimated Salary  
-- Credit Score  
-- Number of Products  
-- Has Credit Card  
-- Is Active Member  
+- Geography, Gender
+- Age, Tenure
+- Balance, Estimated Salary
+- Credit Score
+- Number of Products
+- Has Credit Card
+- Is Active Member
 
-**Target variable:**  
-`Exited` → `0` (stays) or `1` (churns)
+**Target variable:**
+`Exited` -> `0` (stays) or `1` (churns)
 
 ---
 
@@ -45,10 +45,10 @@ The predictive model is built using **TensorFlow/Keras**:
 
 **Training details:**
 
-- Loss: Binary Crossentropy  
-- Optimizer: Adam  
-- Regular evaluation on validation data  
-- Early stopping to prevent overfitting  
+- Loss: Binary Crossentropy
+- Optimizer: Adam
+- Regular evaluation on validation data
+- Early stopping to prevent overfitting
 
 ---
 
@@ -56,9 +56,9 @@ The predictive model is built using **TensorFlow/Keras**:
 
 Performance is assessed using:
 
-- Accuracy  
-- Precision and Recall  
-- Confusion Matrix  
+- Accuracy
+- Precision and Recall
+- Confusion Matrix
 - Churn probability outputs
 
 ---
@@ -74,22 +74,24 @@ The web app allows users to input customer details and receive:
 
 ## 6 Project Structure
 
-├── app.py                 # Streamlit application
-├── experiments.ipynb      # Model training notebook
-├── prediction.ipynb       # Prediction and testing
-├── model.h5               # Trained model
-├── requirements.txt
-└── README.md
+- `app.py`: Streamlit application
+- `experiments.ipynb`: model training notebook
+- `prediction.ipynb`: prediction and testing
+- `model.h5`: trained model
+- `requirements.txt`
+- `Dockerfile`
+- `compose.yaml`
 
 ---
 
-## 7 Technology stack
+## 7 Technology Stack
 
 - Python
 - Pandas, NumPy
 - Scikit-learn
 - TensorFlow / Keras
 - Streamlit
+- Docker
 
 ---
 
@@ -99,8 +101,23 @@ This project highlights how deep learning can be applied to real-world business 
 
 ---
 
+## 9 Container Run
+
+Build and run with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+The app will be available at `http://localhost:8501`.
+
+Runtime configuration:
+
+- Provide `GROQ_API_KEY` through `.env` or container environment variables.
+- The image includes `Churn_Modelling.csv`, model assets, and creates `/app/logs` for runtime logs.
+
+---
+
 ## Author
 
 Developed by Kartik
-
-
