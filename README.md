@@ -117,7 +117,3 @@ Runtime configuration:
 - The image includes `Churn_Modelling.csv`, model assets, and creates `/app/logs` for runtime logs.
 
 ---
-
-## Author
-
-Developed by Kartik
