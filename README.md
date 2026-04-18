@@ -79,8 +79,7 @@ The web app allows users to input customer details and receive:
 - `prediction.ipynb`: prediction and testing
 - `model.h5`: trained model
 - `requirements.txt`
-- `Dockerfile`
-- `compose.yaml`
+- `runtime.txt`
 
 ---
 
@@ -91,7 +90,6 @@ The web app allows users to input customer details and receive:
 - Scikit-learn
 - TensorFlow / Keras
 - Streamlit
-- Docker
 
 ---
 
@@ -101,19 +99,28 @@ This project highlights how deep learning can be applied to real-world business 
 
 ---
 
-## 9 Container Run
+## 9 Local Run With venv
 
-Build and run with Docker Compose:
+Create and activate a virtual environment, then install dependencies:
 
-```bash
-docker compose up --build
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Run the Streamlit app:
+
+```powershell
+streamlit run app.py
 ```
 
 The app will be available at `http://localhost:8501`.
 
 Runtime configuration:
 
-- Provide `GROQ_API_KEY` through `.env` or container environment variables.
-- The image includes `Churn_Modelling.csv`, model assets, and creates `/app/logs` for runtime logs.
+- Provide `GROQ_API_KEY` through `.env` or your shell environment.
+- Keep `Churn_Modelling.csv`, model assets, and the `logs/` directory in the project root.
 
 ---

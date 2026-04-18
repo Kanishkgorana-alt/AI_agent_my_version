@@ -52,13 +52,13 @@ OFFER_LIBRARY = {
     "advisor_callback": "dedicated advisor callback with tailored account guidance", #-? Should be done if credit score is low
 }
 OFFER_FEATURES = list(OFFER_LIBRARY.keys())
-OFFER_EFFECTS = { #-? Initial offer-to-feature effects are heuristic seeds; only actionable features are kept here
-    "cashback_bonus": {"Balance": 0.35, "IsActiveMember": 0.65},
-    "fee_waiver": {"Balance": 0.45, "IsActiveMember": 0.55},
-    "rate_bonus": {"Balance": 0.8, "IsActiveMember": 0.2},
-    "credit_limit_review": {"HasCrCard": 1.0},
-    "product_bundle": {"NumOfProducts": 0.75, "HasCrCard": 0.25},
-    "advisor_callback": {"IsActiveMember": 0.7, "Balance": 0.3},
+OFFER_EFFECTS = { #-? Dense heuristic priors so every offer can influence every actionable feature from the start
+    "cashback_bonus": {"Balance": 0.45, "NumOfProducts": 0.15, "HasCrCard": 0.10, "IsActiveMember": 0.30},
+    "fee_waiver": {"Balance": 0.35, "NumOfProducts": 0.15, "HasCrCard": 0.20, "IsActiveMember": 0.30},
+    "rate_bonus": {"Balance": 0.50, "NumOfProducts": 0.10, "HasCrCard": 0.10, "IsActiveMember": 0.30},
+    "credit_limit_review": {"Balance": 0.10, "NumOfProducts": 0.10, "HasCrCard": 0.55, "IsActiveMember": 0.25},
+    "product_bundle": {"Balance": 0.10, "NumOfProducts": 0.50, "HasCrCard": 0.15, "IsActiveMember": 0.25},
+    "advisor_callback": {"Balance": 0.20, "NumOfProducts": 0.15, "HasCrCard": 0.15, "IsActiveMember": 0.50},
 }
 RNG = np.random.default_rng()
 
@@ -358,6 +358,92 @@ def create_offer_text(
     )
 
 
+def extract_llm_text(response: Any) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text", "")
+            else:
+                text_value = str(item)
+            text_value = str(text_value).strip()
+            if text_value:
+                parts.append(text_value)
+        return " ".join(parts).strip()
+    return str(content).strip()
+
+
+@st.cache_resource
+def get_groq_llm() -> Any:
+    if not LANGCHAIN_AVAILABLE or not os.getenv("GROQ_API_KEY"):
+        return None
+    return ChatGroq(
+        model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        temperature=0.2,
+        api_key=os.getenv("GROQ_API_KEY"),
+    )
+
+
+def generate_offer_text(
+    customer_data: dict[str, Any],
+    churn_rate: float,
+    offer_importance: dict[str, float],
+    offer_scores: dict[str, float],
+    selected_features: list[str],
+    previous_one_rejected: int = 0,
+) -> str:
+    global LANGCHAIN_RUNTIME_ERROR
+
+    fallback_text = create_offer_text(
+        customer_data=customer_data,
+        churn_rate=churn_rate,
+        offer_importance=offer_importance,
+        previous_one_rejected=previous_one_rejected,
+    )
+    llm = get_groq_llm()
+    if llm is None:
+        return fallback_text
+
+    ranked_offers = sorted(offer_importance.items(), key=lambda item: item[1], reverse=True)
+    offer_lines = [
+        (
+            f"- {offer_name}: label={OFFER_LIBRARY[offer_name]}, "
+            f"probability={probability:.4f}, raw_score={float(offer_scores.get(offer_name, 0.0)):.4f}"
+        )
+        for offer_name, probability in ranked_offers
+    ]
+    prompt = "\n".join(
+        [
+            "You are a bank retention strategist.",
+            "Write a concise retention recommendation in at most 3 sentences.",
+            "Use the candidate offers and their relative importance to produce the recommendation.",
+            "Do not mention probabilities, raw scores, models, JSON, or Groq.",
+            "Do not invent offer types outside the candidate list.",
+            f"Customer ID: {customer_data['CustomerId']}",
+            f"Churn risk: {churn_rate:.4f}",
+            f"Credit score: {float(customer_data['CreditScore']):.0f}",
+            f"Selected features to improve: {', '.join(selected_features)}",
+            "Candidate offers:",
+            *offer_lines,
+            "Return only the final recommendation text.",
+        ]
+    )
+
+    try:
+        response = llm.invoke(prompt)
+        offer_text = extract_llm_text(response)
+        if offer_text:
+            LANGCHAIN_RUNTIME_ERROR = ""
+            return offer_text
+        LANGCHAIN_RUNTIME_ERROR = "Groq returned an empty offer response."
+    except Exception as exc:
+        LANGCHAIN_RUNTIME_ERROR = str(exc)
+    return fallback_text
+
+
 #-? Update history is the customer outcome log; parameters are stored separately in parameters.csv
 def add_to_csv(
     pre_rec: pd.Series,
@@ -397,20 +483,22 @@ def simulate_post_offer_record(
     retained_mean: pd.Series,
     offer_given: dict[str, float],
     accepted_offer: bool,
+    state: dict[str, Any],
 ) -> pd.Series:
     if not accepted_offer:
         return pre_rec.copy()
     current = pre_rec.copy()
     for offer_name, importance in offer_given.items():
-        for feature, effect in OFFER_EFFECTS.get(offer_name, {}).items():
-            gap = max(float(retained_mean[feature] - current[feature]), 0.0)
-            delta = gap * float(importance) * float(effect)
+        for feature in ACTIONABLE_FEATURES:
+            learned_effect = float(state["offer_weights"][feature].get(offer_name, 0.0))
+            gap = float(retained_mean[feature] - current[feature])
+            delta = gap * float(importance) * learned_effect
             if feature == "Balance":
                 current[feature] = max(current[feature] + delta, 0.0)
             elif feature == "NumOfProducts":
-                current[feature] = min(current[feature] + delta, 4.0)
+                current[feature] = min(max(current[feature] + delta, 1.0), 4.0)
             elif feature in {"HasCrCard", "IsActiveMember"}:
-                current[feature] = min(current[feature] + delta, 1.0)
+                current[feature] = min(max(current[feature] + delta, 0.0), 1.0)
     return current
 
 
@@ -432,15 +520,14 @@ def update_offer_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[
     relative_change = (d_rec.abs() / normalization_base).clip(lower=0.0, upper=1.0)
     churn_direction = 1.0 if d_churn <= 0 else -1.0
 
-    for feature in ACTIONABLE_FEATURES:
-        alpha = float(relative_change.get(feature, 0.0))
-        if alpha <= 0:
-            continue
-        for offer_name, offer_strength in offer_given.items():
+    for offer_name, offer_strength in offer_given.items():
+        for feature in ACTIONABLE_FEATURES:
+            alpha = float(relative_change.get(feature, 0.0))
+            if alpha <= 0:
+                continue
             current_weight = float(state["offer_weights"][feature][offer_name])
-            state["offer_weights"][feature][offer_name] = current_weight + (
-                churn_direction * alpha * offer_strength
-            )
+            updated_weight = current_weight + (churn_direction * alpha * offer_strength)
+            state["offer_weights"][feature][offer_name] = float(np.clip(updated_weight, -1.0, 1.0))
     return state
 
 
@@ -461,11 +548,10 @@ def select_offer_features(
             continue
         gap = float(required_gap.get(feature, 0.0))
         score = gap * float(feature_weights.get(feature, 0.0))
-        if score > 0:
-            candidate_scores[feature] = score
+        candidate_scores[feature] = score
     if not candidate_scores:
-        fallback = required_gap[ACTIONABLE_FEATURES].clip(lower=0.0).sort_values(ascending=False)
-        return [feature for feature in fallback.index[:2] if float(fallback[feature]) > 0]
+        fallback = (required_gap[ACTIONABLE_FEATURES] * feature_weights.reindex(ACTIONABLE_FEATURES).fillna(0.0)).sort_values(ascending=False)
+        return [str(feature) for feature in fallback.index[:2]]
     sample_size = min(3, len(candidate_scores))
     features = list(candidate_scores)
     probabilities = softmax_dict(candidate_scores)
@@ -493,39 +579,73 @@ def give_offer(
     if not selected_features:
         selected_features = ACTIONABLE_FEATURES[:2]
 
+    selected_feature_scores = {
+        feature: float(required_gap.get(feature, 0.0)) * float(feature_weights.get(feature, 0.0))
+        for feature in selected_features
+    }
     offer_scores = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
     for feature in selected_features:
         gap = float(required_gap.get(feature, 0.0))
+        feature_weight = float(feature_weights.get(feature, 0.0))
         for offer_name, weight in state["offer_weights"][feature].items():
-            offer_scores[offer_name] += float(weight) * gap
+            offer_scores[offer_name] += gap * feature_weight * float(weight)
 
     if float(customer_data["CreditScore"]) >= 650:
         offer_scores.pop("advisor_callback", None)
 
     blocked_offers = excluded_offers or set()
     available_offer = {
-        offer_name: weight
-        for offer_name, weight in offer_scores.items()
+        offer_name: score
+        for offer_name, score in offer_scores.items()
         if offer_name not in blocked_offers
     }
     if not available_offer:
         available_offer = offer_scores
 
     available_offer_probabilities = softmax_dict(available_offer)
-    selection_size = min(2, len(available_offer_probabilities))
-    offer_names = list(available_offer_probabilities)
-    offer_probs = np.array([available_offer_probabilities[name] for name in offer_names], dtype=float)
-    chosen_offers = RNG.choice(offer_names, size=selection_size, replace=False, p=offer_probs)
-    offers_importance = {offer_name: float(available_offer[offer_name]) for offer_name in chosen_offers}
-    offer_string = create_offer_text(
+    ranked_offers = sorted(
+        available_offer_probabilities,
+        key=lambda offer_name: available_offer_probabilities[offer_name],
+        reverse=True,
+    )
+    top_offer_pool = ranked_offers[: min(3, len(ranked_offers))]
+    selection_size = min(2, len(top_offer_pool))
+    top_offer_probabilities = softmax_dict(
+        {offer_name: float(available_offer[offer_name]) for offer_name in top_offer_pool}
+    )
+    chosen_offers = RNG.choice(
+        top_offer_pool,
+        size=selection_size,
+        replace=False,
+        p=np.array([top_offer_probabilities[offer_name] for offer_name in top_offer_pool], dtype=float),
+    )
+    offers_importance = {
+        offer_name: float(top_offer_probabilities[offer_name]) for offer_name in chosen_offers
+    }
+    chosen_offer_scores = {offer_name: float(available_offer[offer_name]) for offer_name in chosen_offers}
+    offer_rankings = [
+        {
+            "offer_name": offer_name,
+            "label": OFFER_LIBRARY[offer_name],
+            "score": float(available_offer[offer_name]),
+            "probability": float(available_offer_probabilities[offer_name]),
+        }
+        for offer_name in ranked_offers
+    ]
+    offer_string = generate_offer_text(
         customer_data=customer_data,
         churn_rate=churn_rate,
         offer_importance=offers_importance,
+        offer_scores=chosen_offer_scores,
+        selected_features=selected_features,
         previous_one_rejected=previous_one_rejected,
     )
     return {
         "selected_features": selected_features,
+        "selected_feature_scores": selected_feature_scores,
         "offers_importance": offers_importance,
+        "offer_scores": chosen_offer_scores,
+        "offer_rankings": offer_rankings,
         "offer_string": offer_string,
         "offer_labels": [OFFER_LIBRARY[offer_name] for offer_name in offers_importance],
         "current_rec": serialize_series(current_rec),
@@ -535,7 +655,7 @@ def give_offer(
 langchain_executor = None
 
 
-def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
+def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
     customer_data = fetch_customer_record(customer_id)
     if customer_data is None:
         raise ValueError(f"CustomerId {customer_id} was not found in the dataset.")
@@ -572,14 +692,13 @@ def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
         "critic": {"score": None, "status": "pending"},
         "offer_context": {
             "selected_features": offer_payload["selected_features"],
+            "selected_feature_scores": offer_payload["selected_feature_scores"],
             "offers_importance": offer_payload["offers_importance"],
+            "offer_scores": offer_payload["offer_scores"],
+            "offer_rankings": offer_payload["offer_rankings"],
             "offer_labels": offer_payload["offer_labels"],
         },
     }
-
-
-def run_learning_agent(customer_id: str, customer_query: str) -> dict[str, Any]:
-    return fallback_analysis(customer_id, customer_query)
 
 
 def process_feedback(
@@ -601,7 +720,7 @@ def process_feedback(
     retained_mean = pd.Series(state["retained_mean"], dtype=float)
     pre_churn = float(observation["pre_churn"])
     offer_given = {key: float(value) for key, value in observation["offer_given"].items()}
-    cur_rec = simulate_post_offer_record(pre_rec, retained_mean, offer_given, accepted_offer)
+    cur_rec = simulate_post_offer_record(pre_rec, retained_mean, offer_given, accepted_offer, state)
     current_churn = predict_churn_from_learning_vector(customer_data, cur_rec)
 
     add_to_csv(
@@ -659,7 +778,10 @@ def process_feedback(
         )
         latest_result["offer_context"] = {
             "selected_features": replacement_offer["selected_features"],
+            "selected_feature_scores": replacement_offer["selected_feature_scores"],
             "offers_importance": replacement_offer["offers_importance"],
+            "offer_scores": replacement_offer["offer_scores"],
+            "offer_rankings": replacement_offer["offer_rankings"],
             "offer_labels": replacement_offer["offer_labels"],
             "previous_one_rejected": 1,
         }
@@ -731,7 +853,10 @@ with manual_tab:
                 "recommended_actions": manual_actions,
                 "offer_context": {
                     "selected_features": manual_offer_payload["selected_features"],
+                    "selected_feature_scores": manual_offer_payload["selected_feature_scores"],
                     "offers_importance": manual_offer_payload["offers_importance"],
+                    "offer_scores": manual_offer_payload["offer_scores"],
+                    "offer_rankings": manual_offer_payload["offer_rankings"],
                     "offer_labels": manual_offer_payload["offer_labels"],
                 },
             }
@@ -748,20 +873,18 @@ with agent_tab: #-? This tab still needs UX review if you want to change the age
         height=100,
     )
 
-    st.caption("The active path uses the local learning-agent logic with static feature weights, adaptive offer weights, and append-only parameter snapshots.")
-    if LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY") and langchain_executor is not None:
-        st.caption("LangChain and Groq are available, but retention decisions are currently driven by the local learning loop.")
-    elif LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY"):
-        st.caption("Groq-backed initialization failed. The local learning loop remains active.")
+    st.caption("Feature selection and offer scoring are computed locally; Groq is used to turn the scored offers into natural-language recommendations when available.")
+    if LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY"):
+        st.caption("Groq offer generation is enabled.")
         if LANGCHAIN_RUNTIME_ERROR:
             st.info(f"Groq status: {LANGCHAIN_RUNTIME_ERROR}")
     elif LANGCHAIN_AVAILABLE:
-        st.caption("LangChain packages are available, but `GROQ_API_KEY` is missing. The local learning loop remains active.")
+        st.caption("LangChain packages are available, but `GROQ_API_KEY` is missing. Offer text falls back to the local template.")
     else:
-        st.caption(f"LangChain packages are unavailable: {LANGCHAIN_IMPORT_ERROR}. The local learning loop remains active.")
+        st.caption(f"LangChain packages are unavailable: {LANGCHAIN_IMPORT_ERROR}. Offer text falls back to the local template.")
     if st.button("Analyze Customer"):
         try:
-            result = run_learning_agent(customer_id.strip(), customer_query.strip())
+            result = analyze_customer(customer_id.strip(), customer_query.strip())
             st.session_state["latest_agent_result"] = result
             st.json(result)
         except Exception as exc:
