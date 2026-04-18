@@ -3,7 +3,7 @@ import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any,cast,Hashable
 
 import numpy as np
 import pandas as pd
@@ -33,30 +33,33 @@ LANGCHAIN_RUNTIME_ERROR = ""
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "Churn_Modelling.csv"
 MODEL_PATH = BASE_DIR / "model.h5"
+LOG_PATH = BASE_DIR / "logs" / "agent_interactions.jsonl" #-?
+LEARNING_STATE_PATH = BASE_DIR / "logs" / "learning_state.json" #-?
 UPDATE_CSV_PATH = BASE_DIR / "logs" / "update_history.csv"
-PARAMETERS_CSV_PATH = BASE_DIR / "logs" / "parameters.csv"
+BATCH_UPDATE_THRESHOLD = 20
 
 ACTIONABLE_FEATURES = [
+    "CreditScore",
     "Balance",
     "NumOfProducts",
     "HasCrCard",
     "IsActiveMember",
 ]
-LEARNING_FEATURES = ACTIONABLE_FEATURES
+LEARNING_FEATURES=ACTIONABLE_FEATURES
 OFFER_LIBRARY = {
     "cashback_bonus": "cashback bonus on card and debit spends",
     "fee_waiver": "temporary waiver on service and transfer fees",
     "rate_bonus": "higher savings return for a limited retention window",
     "credit_limit_review": "priority credit review with card upgrade support",
     "product_bundle": "bundled second product with loyalty benefits",
-    "advisor_callback": "dedicated advisor callback with tailored account guidance", #-? Should be done if credit score is low
+    "advisor_callback": "dedicated advisor callback with tailored account guidance", #-?Should be done if credit score is low
 }
 OFFER_FEATURES = list(OFFER_LIBRARY.keys())
-OFFER_EFFECTS = { #-? Initial offer-to-feature effects are heuristic seeds; only actionable features are kept here
+OFFER_EFFECTS = { #-?In initial state we can't determine which offer increases which feature how much
     "cashback_bonus": {"Balance": 0.35, "IsActiveMember": 0.65},
     "fee_waiver": {"Balance": 0.45, "IsActiveMember": 0.55},
     "rate_bonus": {"Balance": 0.8, "IsActiveMember": 0.2},
-    "credit_limit_review": {"HasCrCard": 1.0},
+    "credit_limit_review": {"CreditScore": 0.7, "HasCrCard": 0.3},
     "product_bundle": {"NumOfProducts": 0.75, "HasCrCard": 0.25},
     "advisor_callback": {"IsActiveMember": 0.7, "Balance": 0.3},
 }
@@ -77,6 +80,12 @@ def load_env_file(env_path: Path) -> None:
 
 
 load_env_file(BASE_DIR / ".env")
+
+
+def append_learning_log(event: dict[str, Any]) -> None: #-?These is not required if sates are stored in update log(with id)
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(event) + "\n")
 
 
 @st.cache_resource
@@ -101,22 +110,25 @@ def load_customer_dataset() -> pd.DataFrame:
 model, label_encoder_gender, onehot_encoder_geo, scaler = load_assets()
 customer_df = load_customer_dataset()
 
+# ======================================================================================================================================= 
+def min_max_standardize(values: pd.Series | dict[str, float] | list[float] | np.ndarray) -> pd.Series:
+    series = pd.Series(values, dtype=float)
+    if series.empty:
+        return series
+    min_value = float(series.min())
+    max_value = float(series.max())
+    if np.isclose(max_value, min_value):
+        return pd.Series(np.zeros(len(series), dtype=float), index=series.index)
+    return (series - min_value) / (max_value - min_value)
 
+# ??
 @st.cache_data
 def build_learning_feature_dataset() -> tuple[pd.DataFrame, pd.Series]:
     base_features = customer_df[LEARNING_FEATURES].astype(float).copy()
     target = customer_df["Exited"].astype(int).copy()
     return base_features, target
 
-
-def scale_learning_features(feature_frame: pd.DataFrame) -> pd.DataFrame:
-    scaler_features = list(getattr(scaler, "feature_names_in_", []))
-    scaler_mean = pd.Series(getattr(scaler, "mean_", []), index=scaler_features, dtype=float)
-    scaler_scale = pd.Series(getattr(scaler, "scale_", []), index=scaler_features, dtype=float)
-    learning_mean = scaler_mean.reindex(LEARNING_FEATURES)
-    learning_scale = scaler_scale.reindex(LEARNING_FEATURES).replace(0.0, 1.0)
-    return (feature_frame - learning_mean) / learning_scale
-
+#-?Why both above and below functions are required
 
 def customer_to_learning_vector(customer_data: dict[str, Any]) -> pd.Series:
     return pd.Series(
@@ -128,8 +140,7 @@ def customer_to_learning_vector(customer_data: dict[str, Any]) -> pd.Series:
 def serialize_series(series: pd.Series) -> dict[str, float]:
     return {key: float(value) for key, value in series.items()}
 
-
-#-? Rounded conversion is still required here because these fields are binary/count inputs to the churn model
+#-? Why this is here, who said to round off values 
 def predict_churn_from_learning_vector(customer_data: dict[str, Any], learning_vector: pd.Series) -> float:
     updated_customer = dict(customer_data)
     for feature, value in learning_vector.items():
@@ -139,90 +150,49 @@ def predict_churn_from_learning_vector(customer_data: dict[str, Any], learning_v
             updated_customer[feature] = float(value)
     return predict_churn(updated_customer)
 
-
+# =======================================================================================================================================
 def initialize_learning_state() -> dict[str, Any]:
     feature_frame, target = build_learning_feature_dataset()
-    scaled_feature_frame = scale_learning_features(feature_frame)
     retained_mean = feature_frame.loc[target == 0].mean()
-    retained_mean_scaled = scaled_feature_frame.loc[target == 0].mean()
-    churned_mean_scaled = scaled_feature_frame.loc[target == 1].mean()
-    feature_weights = (retained_mean_scaled - churned_mean_scaled).fillna(0.0)
+    churned_mean = feature_frame.loc[target == 1].mean() #-? This is also not required
+    feature_diff = retained_mean - churned_mean #-? Need difference between current feature and tar=0 feaature
+    feature_weight_magnitude = min_max_standardize(feature_diff.abs()) #-? required?
+    feature_weights = (feature_weight_magnitude * np.sign(feature_diff)).fillna(0.0)
+    feature_weights = (feature_diff).fillna(0.0)
+
     offer_weights = {
-        feature: {
-            offer_name: float(OFFER_EFFECTS.get(offer_name, {}).get(feature, 0.0))
-            for offer_name in OFFER_LIBRARY
-        }
+        feature: {offer_name: 0.5 for offer_name in OFFER_LIBRARY}
         for feature in LEARNING_FEATURES
     }
     return {
         "retained_mean": serialize_series(retained_mean),
         "feature_weights": serialize_series(feature_weights),
         "offer_weights": offer_weights,
+        "observations": {},
+        "pending_updates": [],
+        "added_non_updated_count": 0,
     }
 
-
-def append_parameters_snapshot(
-    state: dict[str, Any],
-    reason: str,
-    customer_id: str = "",
-) -> None:
-    payload = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "reason": reason,
-        "customer_id": customer_id,
-        "feature_weights": json.dumps(state["feature_weights"]),
-        "offer_weights": json.dumps(state["offer_weights"]),
-        "retained_mean": json.dumps(state["retained_mean"]),
-    }
-    PARAMETERS_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_frame = pd.DataFrame([payload])
-    if PARAMETERS_CSV_PATH.exists():
-        snapshot_frame.to_csv(PARAMETERS_CSV_PATH, mode="a", header=False, index=False)
-    else:
-        snapshot_frame.to_csv(PARAMETERS_CSV_PATH, index=False)
+#-? When I am storing in update.csv then why this
+def save_learning_state(state: dict[str, Any]) -> None:
+    LEARNING_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LEARNING_STATE_PATH.open("w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
 
 
 def load_learning_state() -> dict[str, Any]:
-    if not PARAMETERS_CSV_PATH.exists():
+    if not LEARNING_STATE_PATH.exists():
         state = initialize_learning_state()
-        append_parameters_snapshot(state, reason="initialize")
+        save_learning_state(state)
         return state
-
-    state_frame = pd.read_csv(PARAMETERS_CSV_PATH)
-    if state_frame.empty:
-        state = initialize_learning_state()
-        append_parameters_snapshot(state, reason="initialize")
-        return state
-
-    latest = state_frame.iloc[-1]
-    try:
-        state = {
-            "feature_weights": json.loads(latest["feature_weights"]),
-            "offer_weights": json.loads(latest["offer_weights"]),
-            "retained_mean": json.loads(latest["retained_mean"]),
-        }
-    except Exception:
-        state = initialize_learning_state()
-        append_parameters_snapshot(state, reason="reinitialize")
-        return state
-
-    if set(state.get("feature_weights", {})) != set(LEARNING_FEATURES):
-        state = initialize_learning_state()
-        append_parameters_snapshot(state, reason="reinitialize")
-        return state
-
+    with LEARNING_STATE_PATH.open("r", encoding="utf-8") as file:
+        state = json.load(file)
     if set(state.get("offer_weights", {})) != set(LEARNING_FEATURES):
         state = initialize_learning_state()
-        append_parameters_snapshot(state, reason="reinitialize")
-        return state
-
+        save_learning_state(state)
     return state
 
-
-def get_observation_store() -> dict[str, dict[str, Any]]:
-    return st.session_state.setdefault("observations", {})
-
-
+#===================================================================================================================================
 def softmax_dict(score_map: dict[str, float]) -> dict[str, float]:
     if not score_map:
         return {}
@@ -233,7 +203,50 @@ def softmax_dict(score_map: dict[str, float]) -> dict[str, float]:
     probabilities = weights / weights.sum()
     return {label: float(probability) for label, probability in zip(labels, probabilities)}
 
+# ==============================================================================================================================
+def get_offer_history(offer_importance: dict[str, Any],limit: int = 8) -> list[dict[str, Any]]:
 
+    if not UPDATE_CSV_PATH.exists():
+        return []
+
+    history_frame = pd.read_csv(UPDATE_CSV_PATH)
+    if history_frame.empty:
+        return []
+
+    target = np.array(
+        [float(offer_importance.get(k, 0.0)) for k in OFFER_FEATURES],
+        dtype=float
+    )
+
+    def row_distance(row):
+        vec = np.array(
+            [float(row.get(f"offer_{k}", 0.0)) for k in OFFER_FEATURES],
+            dtype=float
+        )
+        return np.linalg.norm(vec - target)
+
+    history_frame["__distance"] = history_frame.apply(row_distance, axis=1)
+
+    history_frame = history_frame.sort_values("__distance")
+
+    limit = min(limit, len(history_frame))
+
+    return cast(
+        list[dict[str, Any]],
+        history_frame.head(limit)
+        .drop(columns="__distance")
+        .to_dict("records")
+    )
+
+
+# def risk_level(probability: float) -> str:
+#     if probability >= 0.8:
+#         return "high"
+#     if probability >= 0.55:
+#         return "medium"
+#     return "low"
+
+#================================================================================================================
 def build_feature_frame(customer_data: dict[str, Any]) -> pd.DataFrame:
     encoded_gender = label_encoder_gender.transform([customer_data["Gender"]])[0]
     base_frame = pd.DataFrame(
@@ -257,48 +270,54 @@ def build_feature_frame(customer_data: dict[str, Any]) -> pd.DataFrame:
     final_frame = pd.concat([base_frame.reset_index(drop=True), geography_frame], axis=1)
     return final_frame
 
-
+#==================================================================================================================================
 def predict_churn(customer_data: dict[str, Any]) -> float:
     feature_frame = build_feature_frame(customer_data)
     scaled_data = scaler.transform(feature_frame)
     prediction = model.predict(scaled_data, verbose=0)
     return float(prediction[0][0])
 
+#-?
+update_df = pd.read_csv(UPDATE_CSV_PATH)
 
 def _search_update_df(df: pd.DataFrame, customer_id: str) -> dict[str, Any] | None:
     df_rev = df.iloc[::-1]
+
     record = df_rev[df_rev["customer_id"].astype(str) == str(customer_id)]
     if record.empty:
         return None
+
     row = record.iloc[0]
+
+    # parse cur_rec (string → dict)
     cur_rec = json.loads(row["cur_rec"])
+
     return {str(k): v for k, v in cur_rec.items()}
 
 
 def _search_customer_df(df: pd.DataFrame, customer_id: str) -> dict[str, Any] | None:
     df_rev = df.iloc[::-1]
+
     record = df_rev[df_rev["CustomerId"].astype(str) == str(customer_id)]
     if record.empty:
         return None
+
     row = record.iloc[0].to_dict()
     row.pop("RowNumber", None)
+
     return {str(k): v for k, v in row.items()}
 
 
-#-? Remove transaction flow; latest actionable profile comes from update_history.csv merged onto the base customer row
 def fetch_customer_record(customer_id: str) -> dict[str, Any] | None:
-    base_record = _search_customer_df(customer_df, customer_id)
-    if base_record is None:
-        return None
-    if UPDATE_CSV_PATH.exists():
-        update_df = pd.read_csv(UPDATE_CSV_PATH)
-        updated_fields = _search_update_df(update_df, customer_id)
-        if updated_fields is not None:
-            base_record.update(updated_fields)
-    return base_record
+    # 1. search update history (latest state)
+    result = _search_update_df(update_df, customer_id)
+    if result is not None:
+        return result
 
+    # 2. fallback to original dataset
+    return _search_customer_df(customer_df, customer_id)
 
-#-? ADD_INTERPRETABILITY
+## ----------------------------ADD_INTERPRETABILITY--------------------------
 def build_insights(customer_data: dict[str, Any], probability: float) -> list[str]:
     insights: list[str] = []
     if float(customer_data["Balance"]) < 50000:
@@ -320,7 +339,8 @@ def build_insights(customer_data: dict[str, Any], probability: float) -> list[st
     return insights[:4]
 
 
-#-? Pass richer change details here later if critic scoring should depend on actual feature movement
+## Change according to feature change ,offer value , bank loss risk, churn change
+#-? Pass change details to this
 def critic_score(probability: float, accepted_offer: bool, feedback_text: str) -> dict[str, Any]:
     base_score = 0.2 if probability >= 0.8 else 0.5 if probability >= 0.6 else 0.7
     if accepted_offer:
@@ -333,7 +353,7 @@ def critic_score(probability: float, accepted_offer: bool, feedback_text: str) -
         "status": "success" if final_score >= 0.7 else "failure",
     }
 
-
+#========================================================================================================================================
 def create_offer_text(
     customer_data: dict[str, Any],
     churn_rate: float,
@@ -354,11 +374,11 @@ def create_offer_text(
     return (
         f"{prefix}: propose a {urgency} {benefit_band} retention package centered on "
         f"{', '.join(selected_labels)} for customer {customer_data['CustomerId']}."
-        f" Credit score {int(credit_score)} and churn risk {churn_rate:.2f}."
+        f" Credit score {int(credit_score)} and churn risk {churn_rate:.2f}"
+        f"{customer_data['CustomerId']['estimated_salary']} is its estimated salary"
     )
 
 
-#-? Update history is the customer outcome log; parameters are stored separately in parameters.csv
 def add_to_csv(
     pre_rec: pd.Series,
     cur_rec: pd.Series,
@@ -368,7 +388,11 @@ def add_to_csv(
     offer_string: str,
     customer_id: str,
     accepted_offer: bool,
-) -> None:
+) -> dict[str, Any]:
+    offer_flat = {
+        f"offer_{k}": float(offer_given.get(k, 0.0))
+        for k in OFFER_FEATURES
+    }
     payload = {
         "timestamp": datetime.utcnow().isoformat(),
         "customer_id": customer_id,
@@ -376,22 +400,24 @@ def add_to_csv(
         "cur_rec": json.dumps(serialize_series(cur_rec)),
         "pre_churn": float(pre_churn),
         "current_churn": float(current_churn),
-        "offer_given": json.dumps({k: float(v) for k, v in offer_given.items()}),
         "offer_string": offer_string,
         "accepted_offer": int(accepted_offer),
+        **offer_flat
     }
     update_frame = pd.DataFrame([payload])
+
     UPDATE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     if UPDATE_CSV_PATH.exists():
         update_frame.to_csv(UPDATE_CSV_PATH, mode="a", header=False, index=False)
     else:
         update_frame.to_csv(UPDATE_CSV_PATH, index=False)
+    return payload
+#-? Why it is returning payload back
 
+def remove_from_observation(state: dict[str, Any], customer_id: str) -> dict[str, Any] | None:
+    return state.get("observations", {}).pop(customer_id, None)
 
-def remove_from_observation(customer_id: str) -> dict[str, Any] | None:
-    return get_observation_store().pop(customer_id, None)
-
-
+#-? Below one will be done at customer side also Remove Credit score as I think it can't be improved by offers
 def simulate_post_offer_record(
     pre_rec: pd.Series,
     retained_mean: pd.Series,
@@ -405,7 +431,9 @@ def simulate_post_offer_record(
         for feature, effect in OFFER_EFFECTS.get(offer_name, {}).items():
             gap = max(float(retained_mean[feature] - current[feature]), 0.0)
             delta = gap * float(importance) * float(effect)
-            if feature == "Balance":
+            if feature == "CreditScore":
+                current[feature] = min(current[feature] + delta, 900.0)
+            elif feature == "Balance":
                 current[feature] = max(current[feature] + delta, 0.0)
             elif feature == "NumOfProducts":
                 current[feature] = min(current[feature] + delta, 4.0)
@@ -414,53 +442,49 @@ def simulate_post_offer_record(
     return current
 
 
-def update_offer_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    retained_mean = pd.Series(state["retained_mean"], dtype=float)
-    pre_rec = pd.Series(update["pre_rec"], dtype=float)
-    cur_rec = pd.Series(update["cur_rec"], dtype=float)
-    offer_given = {
-        offer_name: float(weight)
-        for offer_name, weight in update["offer_given"].items()
-        if float(weight) != 0.0
-    }
-    if not offer_given:
-        return state
-
-    d_rec = cur_rec - pre_rec
-    d_churn = float(update["current_churn"]) - float(update["pre_churn"])
-    normalization_base = (retained_mean - pre_rec).abs().replace(0.0, 1.0)
-    relative_change = (d_rec.abs() / normalization_base).clip(lower=0.0, upper=1.0)
-    churn_direction = 1.0 if d_churn <= 0 else -1.0
-
-    for feature in ACTIONABLE_FEATURES:
-        alpha = float(relative_change.get(feature, 0.0))
-        if alpha <= 0:
-            continue
-        for offer_name, offer_strength in offer_given.items():
-            current_weight = float(state["offer_weights"][feature][offer_name])
-            state["offer_weights"][feature][offer_name] = current_weight + (
-                churn_direction * alpha * offer_strength
-            )
+def update_offer_weights(state: dict[str, Any], updates: list[dict[str, Any]]) -> dict[str, Any]:
+    reference_diff = pd.Series(state["feature_reference_diff"], dtype=float)
+    #-? In below codes alpha calculation need to be revised
+    normalization_base = reference_diff.abs().replace(0.0, 1.0)
+    for update in updates:
+        pre_rec = pd.Series(update["pre_rec"], dtype=float)
+        cur_rec = pd.Series(update["cur_rec"], dtype=float)
+        offer_given = update["offer_given"]
+        d_rec = cur_rec - pre_rec
+        d_churn = float(update["current_churn"]) - float(update["pre_churn"])
+        relative_change = (d_rec.abs() / normalization_base).clip(lower=0.0)
+        alpha_series = min_max_standardize(relative_change).clip(lower=0.0, upper=1.0)
+        for feature, alpha in alpha_series.items(): #-? Change offer value of those only which were selected don't update for the ones which were 0
+            if float(alpha) <= 0:
+                continue
+            alignment = np.sign(d_rec[feature]) * np.sign(reference_diff[feature]) #-? Why reference_diff is used here
+            change_sign = 1.0 if d_churn <= 0 and alignment >= 0 else -1.0 #-? No need to consider how feature affects churn that is done while weighing feature importance in initialize_state()
+            for offer_name, offer_strength in offer_given.items():
+                current_weight = float(state["offer_weights"][feature][offer_name])
+                updated_weight = ((1 - float(alpha)) * current_weight) + (
+                    change_sign * float(alpha) * float(offer_strength)
+                )
+                state["offer_weights"][feature][offer_name] = float(max(updated_weight, 0.0)) #-? No need to remove negative value, because while selecting softmax will be applied on the weights
     return state
 
 
-def store_in_observation(customer_id: str, observation_payload: dict[str, Any]) -> None:
-    get_observation_store()[customer_id] = observation_payload
+def store_in_observation(state: dict[str, Any], customer_id: str, observation_payload: dict[str, Any]) -> None:
+    state.setdefault("observations", {})[customer_id] = observation_payload
 
-
-#-? excluded_features is kept so the selector can skip features if you add that constraint later
+#=========================================================================================================================================
 def select_offer_features(
     required_gap: pd.Series,
     feature_weights: pd.Series,
     excluded_features: set[str] | None = None,
 ) -> list[str]:
     excluded = excluded_features or set()
-    candidate_scores: dict[str, float] = {}
+    #-? Where excluded feature will be used
+    candidate_scores = {}
     for feature in ACTIONABLE_FEATURES:
         if feature in excluded:
             continue
         gap = float(required_gap.get(feature, 0.0))
-        score = gap * float(feature_weights.get(feature, 0.0))
+        score = gap *float(feature_weights.get(feature, 0.0))
         if score > 0:
             candidate_scores[feature] = score
     if not candidate_scores:
@@ -468,13 +492,8 @@ def select_offer_features(
         return [feature for feature in fallback.index[:2] if float(fallback[feature]) > 0]
     sample_size = min(3, len(candidate_scores))
     features = list(candidate_scores)
-    probabilities = softmax_dict(candidate_scores)
-    selected = RNG.choice(
-        features,
-        size=sample_size,
-        replace=False,
-        p=np.array([probabilities[feature] for feature in features], dtype=float),
-    )
+    probabilities = softmax_dict({features: float(candidate_scores) for features, candidate_scores in zip(features, candidate_scores)})
+    selected = RNG.choice(features, size=sample_size, replace=False, p=np.array(list(probabilities.values()),dtype=float))
     return [str(feature) for feature in selected]
 
 
@@ -498,25 +517,26 @@ def give_offer(
         gap = float(required_gap.get(feature, 0.0))
         for offer_name, weight in state["offer_weights"][feature].items():
             offer_scores[offer_name] += float(weight) * gap
-
-    if float(customer_data["CreditScore"]) >= 650:
-        offer_scores.pop("advisor_callback", None)
-
     blocked_offers = excluded_offers or set()
-    available_offer = {
-        offer_name: weight
+    available_offer= {
+        offer_name: probability
         for offer_name, weight in offer_scores.items()
         if offer_name not in blocked_offers
     }
     if not available_offer:
         available_offer = offer_scores
-
     available_offer_probabilities = softmax_dict(available_offer)
+
     selection_size = min(2, len(available_offer_probabilities))
     offer_names = list(available_offer_probabilities)
     offer_probs = np.array([available_offer_probabilities[name] for name in offer_names], dtype=float)
     chosen_offers = RNG.choice(offer_names, size=selection_size, replace=False, p=offer_probs)
-    offers_importance = {offer_name: float(available_offer[offer_name]) for offer_name in chosen_offers}
+    chosen_offer_map = {offer_name: available_offer[offer_name] for offer_name in chosen_offers}
+    offers_importance = {
+        offer_name:weight
+        for offer_name, weight in chosen_offer_map.items()
+    }
+    history = get_offer_history(offers_importance,limit=5)
     offer_string = create_offer_text(
         customer_data=customer_data,
         churn_rate=churn_rate,
@@ -525,6 +545,7 @@ def give_offer(
     )
     return {
         "selected_features": selected_features,
+        # "required_gap": serialize_series(required_gap), already compensated in importance
         "offers_importance": offers_importance,
         "offer_string": offer_string,
         "offer_labels": [OFFER_LIBRARY[offer_name] for offer_name in offers_importance],
@@ -533,7 +554,6 @@ def give_offer(
 
 
 langchain_executor = None
-
 
 def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
     customer_data = fetch_customer_record(customer_id)
@@ -546,6 +566,7 @@ def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
     offer_payload = give_offer(customer_data, probability, state)
 
     store_in_observation(
+        state,
         customer_id,
         {
             "customer_id": customer_id,
@@ -558,15 +579,17 @@ def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
             "created_at": datetime.utcnow().isoformat(),
         },
     )
+    save_learning_state(state)
 
     recommended_actions = [offer_payload["offer_string"]]
     recommended_actions.extend(
         f"Prioritize {feature} improvement for this customer." for feature in offer_payload["selected_features"]
     )
-    return {
+    result = {
         "customer_id": customer_id,
         "customer_query": customer_query,
         "churn_risk": round(probability, 4),
+        # "risk_level": risk_level(probability),
         "insights": insights,
         "recommended_actions": recommended_actions,
         "critic": {"score": None, "status": "pending"},
@@ -574,8 +597,18 @@ def fallback_analysis(customer_id: str, customer_query: str) -> dict[str, Any]:
             "selected_features": offer_payload["selected_features"],
             "offers_importance": offer_payload["offers_importance"],
             "offer_labels": offer_payload["offer_labels"],
+            "required_gap": offer_payload["required_gap"],
         },
     }
+    append_learning_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "analysis",
+            "mode": "learning_logic",
+            "payload": result,
+        }
+    )
+    return result
 
 
 def run_learning_agent(customer_id: str, customer_query: str) -> dict[str, Any]:
@@ -593,7 +626,7 @@ def process_feedback(
         raise ValueError(f"CustomerId {customer_id} was not found in the dataset.")
 
     state = load_learning_state()
-    observation = remove_from_observation(customer_id)
+    observation = remove_from_observation(state, customer_id)
     if observation is None:
         raise ValueError("No active observation found for this customer. Analyze the customer again before submitting feedback.")
 
@@ -615,17 +648,22 @@ def process_feedback(
         accepted_offer=accepted_offer,
     )
 
-    state = update_offer_weights(
-        state,
+    state.setdefault("pending_updates", []).append(
         {
             "pre_rec": serialize_series(pre_rec),
             "cur_rec": serialize_series(cur_rec),
             "pre_churn": pre_churn,
             "current_churn": current_churn,
             "offer_given": offer_given,
-        },
+            "offer_string": observation["offer_string"],
+        }
     )
-    append_parameters_snapshot(state, reason="feedback_update", customer_id=customer_id)
+    state["added_non_updated_count"] = int(state.get("added_non_updated_count", 0)) + 1
+
+    if state["added_non_updated_count"] > BATCH_UPDATE_THRESHOLD and state["pending_updates"]:
+        state = update_offer_weights(state, state["pending_updates"])
+        state["pending_updates"] = []
+        state["added_non_updated_count"] = 0
 
     assessment = critic_score(float(latest_result["churn_risk"]), accepted_offer, feedback_text)
     latest_result["critic"] = assessment
@@ -641,6 +679,7 @@ def process_feedback(
             previous_one_rejected=1,
         )
         store_in_observation(
+            state,
             customer_id,
             {
                 "customer_id": customer_id,
@@ -661,11 +700,23 @@ def process_feedback(
             "selected_features": replacement_offer["selected_features"],
             "offers_importance": replacement_offer["offers_importance"],
             "offer_labels": replacement_offer["offer_labels"],
+            "required_gap": replacement_offer["required_gap"],
             "previous_one_rejected": 1,
         }
 
+    append_learning_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "feedback",
+            "customer_id": customer_id,
+            "accepted_offer": accepted_offer,
+            "feedback": feedback_text,
+            "critic": assessment,
+            "post_offer_churn": round(current_churn, 4),
+        }
+    )
+    save_learning_state(state)
     return latest_result
-
 
 st.title("Bank Customer Retention Learning Agent")
 st.caption("Performance element + learning element + critic on top of the existing churn model.")
@@ -678,8 +729,9 @@ with st.expander("Project Structure", expanded=False):
                 "- `Churn_Modelling.csv`: customer profile dataset used as the prototype customer store",
                 "- `model.h5`: trained TensorFlow churn model",
                 "- `label_encoder_gender.pkl`, `onehot_encoder_geo.pkl`, `Scaler.pkl`: preprocessing assets",
-                "- `logs/parameters.csv`: append-only parameter snapshots for feature weights and offer weights",
-                "- `logs/update_history.csv`: recorded customer offer outcomes",
+                "- `logs/agent_interactions.jsonl`: runtime learning log written by the app",
+                "- `logs/learning_state.json`: persisted feature and offer weights plus active observations",
+                "- `logs/update_history.csv`: recorded observation outcomes used for batch offer-weight updates",
             ]
         )
     )
@@ -714,6 +766,7 @@ with manual_tab:
             "Geography": geography,
         }
         probability = predict_churn(manual_customer)
+        # level = risk_level(probability)
         manual_offer_payload = give_offer(manual_customer, probability, load_learning_state())
         manual_actions = [manual_offer_payload["offer_string"]]
         manual_actions.extend(
@@ -723,21 +776,24 @@ with manual_tab:
         st.subheader("Prediction Result")
         st.write(f"Churn Probability: {probability:.2f}")
         st.progress(float(probability))
+        # st.write(f"Risk Level: {level.upper()}")
         st.json(
             {
                 "customer_id": "manual_input",
                 "churn_risk": round(probability, 4),
+                # "risk_level": level,
                 "insights": build_insights(manual_customer, probability),
                 "recommended_actions": manual_actions,
                 "offer_context": {
                     "selected_features": manual_offer_payload["selected_features"],
                     "offers_importance": manual_offer_payload["offers_importance"],
                     "offer_labels": manual_offer_payload["offer_labels"],
+                    "required_gap": manual_offer_payload["required_gap"],
                 },
             }
         )
 
-with agent_tab: #-? This tab still needs UX review if you want to change the agent-side interaction further
+with agent_tab: #-? This need to be checked
     st.subheader("Analyze an existing customer")
     st.write("Use a `CustomerId` from `Churn_Modelling.csv`, for example `15634602`.")
 
@@ -748,7 +804,7 @@ with agent_tab: #-? This tab still needs UX review if you want to change the age
         height=100,
     )
 
-    st.caption("The active path uses the local learning-agent logic with static feature weights, adaptive offer weights, and append-only parameter snapshots.")
+    st.caption("The active path uses the local learning-agent logic with persisted feature weights, offer weights, observation memory, and batched updates.")
     if LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY") and langchain_executor is not None:
         st.caption("LangChain and Groq are available, but retention decisions are currently driven by the local learning loop.")
     elif LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY"):
@@ -786,5 +842,27 @@ with agent_tab: #-? This tab still needs UX review if you want to change the age
             except Exception as exc:
                 st.error(str(exc))
 st.markdown("Built with Streamlit, TensorFlow, and LangChain.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
