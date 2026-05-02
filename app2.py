@@ -61,6 +61,7 @@ OFFER_EFFECTS = { #-? Dense heuristic priors so every offer can influence every 
     "advisor_callback": {"Balance": 0.20, "NumOfProducts": 0.15, "HasCrCard": 0.15, "IsActiveMember": 0.50},
 }
 RNG = np.random.default_rng()
+BATCH_SIZE = 5
 
 st.set_page_config(page_title="Bank Customer Retention Agent", layout="wide")
 
@@ -233,6 +234,69 @@ def softmax_dict(score_map: dict[str, float]) -> dict[str, float]:
     probabilities = weights / weights.sum()
     return {label: float(probability) for label, probability in zip(labels, probabilities)}
 
+def safe_sample(
+    items: list[str],
+    scores: dict[str, float],
+    k: int,
+    rng: np.random.Generator,
+) -> tuple[list[str], dict[str, float]]:
+    """
+    Returns (chosen_items, chosen_probs) with robust handling of zeros/degeneracy.
+    - Softmax over scores
+    - Smoothing
+    - Fallback to uniform if needed
+    - No replacement sampling (size clipped safely)
+    """
+    if not items:
+        return [], {}
+
+    # build probability array via softmax on provided scores
+    raw = np.array([float(scores.get(it, 0.0)) for it in items], dtype=float)
+    raw = raw - raw.max()  # stability
+    probs = np.exp(raw)
+
+    # smoothing to avoid exact zeros
+    probs = probs + 1e-8
+
+    # normalize (guard)
+    s = probs.sum()
+    if s <= 0 or not np.isfinite(s):
+        probs = np.ones(len(items)) / len(items)
+    else:
+        probs = probs / s
+
+    # filter near-zero (optional but safer)
+    mask = probs > 1e-10
+    filtered_items = np.array(items)[mask]
+    filtered_probs = probs[mask]
+
+    # fallback if everything filtered out
+    if len(filtered_items) == 0:
+        filtered_items = np.array(items)
+        filtered_probs = np.ones(len(items)) / len(items)
+    else:
+        # renormalize after filtering
+        filtered_probs = filtered_probs / filtered_probs.sum()
+
+    # safe size
+    k = int(min(k, len(filtered_items)))
+    if k <= 0:
+        return [], {}
+
+    chosen = rng.choice(
+        filtered_items,
+        size=k,
+        replace=False,
+        p=filtered_probs
+    )
+
+    # map chosen → their probabilities correctly
+    prob_map = {
+        it: float(filtered_probs[np.where(filtered_items == it)[0][0]])
+        for it in chosen
+    }
+
+    return list(chosen), prob_map
 
 def build_feature_frame(customer_data: dict[str, Any]) -> pd.DataFrame:
     encoded_gender = label_encoder_gender.transform([customer_data["Gender"]])[0]
@@ -318,21 +382,6 @@ def build_insights(customer_data: dict[str, Any], probability: float) -> list[st
     else:
         insights.append("current profile looks comparatively stable")
     return insights[:4]
-
-
-#-? Pass richer change details here later if critic scoring should depend on actual feature movement
-def critic_score(probability: float, accepted_offer: bool, feedback_text: str) -> dict[str, Any]:
-    base_score = 0.2 if probability >= 0.8 else 0.5 if probability >= 0.6 else 0.7
-    if accepted_offer:
-        base_score += 0.25
-    if feedback_text.strip():
-        base_score += 0.1
-    final_score = min(round(base_score, 2), 1.0)
-    return {
-        "score": final_score,
-        "status": "success" if final_score >= 0.7 else "failure",
-    }
-
 
 def create_offer_text(
     customer_data: dict[str, Any],
@@ -502,6 +551,32 @@ def simulate_post_offer_record(
                 current[feature] = min(max(current[feature] + delta, 0.0), 1.0)
     return current
 
+def compute_reward(update: dict[str, Any]) -> float:
+    alpha = 0.8
+    beta = 0.2
+
+    accepted = int(update.get("accepted_offer", 0))
+    pre_churn = float(update["pre_churn"])
+    current_churn = float(update["current_churn"])
+
+    acceptance_signal = 1.0 if accepted == 1 else -1.0
+    churn_signal = 1.0 if current_churn <= pre_churn else -1.0
+
+    reward = alpha * acceptance_signal + beta * churn_signal
+
+    # ---------- structured feedback influence ----------
+    reason = update.get("feedback_reason", "")
+
+    if reason == "Liked benefits":
+        reward += 0.2
+    elif reason == "Too expensive":
+        reward -= 0.2
+    elif reason == "Not relevant":
+        reward -= 0.2
+    elif reason == "Prefers other offer":
+        reward -= 0.3
+
+    return float(np.clip(reward, -1.0, 1.0))
 
 def update_offer_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     retained_mean = pd.Series(state["retained_mean"], dtype=float)
@@ -516,10 +591,9 @@ def update_offer_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[
         return state
 
     d_rec = cur_rec - pre_rec
-    d_churn = float(update["current_churn"]) - float(update["pre_churn"])
+    reward = compute_reward(update)
     normalization_base = (retained_mean - pre_rec).abs().replace(0.0, 1.0)
     relative_change = (d_rec.abs() / normalization_base).clip(lower=0.0, upper=1.0)
-    churn_direction = 1.0 if d_churn <= 0 else -1.0
 
     for offer_name, offer_strength in offer_given.items():
         for feature in ACTIONABLE_FEATURES:
@@ -527,9 +601,44 @@ def update_offer_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[
             if alpha <= 0:
                 continue
             current_weight = float(state["offer_weights"][feature][offer_name])
-            updated_weight = current_weight + (churn_direction * alpha * offer_strength)
+            learning_rate = 0.1
+            updated_weight = current_weight + (learning_rate * reward * alpha * offer_strength)
             state["offer_weights"][feature][offer_name] = float(np.clip(updated_weight, -1.0, 1.0))
     return state
+
+def update_feature_weights(state: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    pre_rec = pd.Series(update["pre_rec"], dtype=float)
+    cur_rec = pd.Series(update["cur_rec"], dtype=float)
+
+    d_rec = cur_rec - pre_rec
+    reward = compute_reward(update)
+    direction = reward
+
+    for feature in ACTIONABLE_FEATURES:
+        change = abs(float(d_rec.get(feature, 0.0)))
+
+        if change == 0:
+            continue
+
+        current_weight = float(state["feature_weights"][feature])
+
+        updated_weight = current_weight + direction * change * 0.1
+
+        state["feature_weights"][feature] = float(
+            np.clip(updated_weight, -1.0, 1.0)
+        )
+
+    return state
+
+def get_customer_offer_history(customer_id: str) -> list[dict[str, Any]]:
+    if not UPDATE_CSV_PATH.exists():
+        return []
+
+    df = pd.read_csv(UPDATE_CSV_PATH)
+    history = df[df["customer_id"].astype(str) == str(customer_id)]
+    if history.empty:
+        return []
+    return history.tail(5).to_dict("records")
 
 
 def store_in_observation(customer_id: str, observation_payload: dict[str, Any]) -> None:
@@ -556,12 +665,13 @@ def select_offer_features(
     sample_size = min(3, len(candidate_scores))
     features = list(candidate_scores)
     probabilities = softmax_dict(candidate_scores)
-    selected = RNG.choice(
-        features,
-        size=sample_size,
-        replace=False,
-        p=np.array([probabilities[feature] for feature in features], dtype=float),
-    )
+    
+    selected, _ = safe_sample(
+    items=features,
+    scores=candidate_scores,
+    k=sample_size,
+    rng=RNG)
+
     return [str(feature) for feature in selected]
 
 
@@ -584,12 +694,29 @@ def give_offer(
         feature: float(required_gap.get(feature, 0.0)) * float(feature_weights.get(feature, 0.0))
         for feature in selected_features
     }
+    history = get_customer_offer_history(customer_data["CustomerId"])
+    history_bonus = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
+    history_penalty = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
+
+    for record in history:
+        past_offers = json.loads(record["offer_given"])
+        for offer_name in past_offers:
+            if int(record["accepted_offer"]) == 1:
+                history_bonus[offer_name] += 0.2
+            else:
+                history_penalty[offer_name] += 0.3
+
     offer_scores = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
     for feature in selected_features:
         gap = float(required_gap.get(feature, 0.0))
         feature_weight = float(feature_weights.get(feature, 0.0))
         for offer_name, weight in state["offer_weights"][feature].items():
-            offer_scores[offer_name] += gap * feature_weight * float(weight)
+            base = gap * feature_weight * float(weight)
+            offer_scores[offer_name] += (
+                base
+                + history_bonus.get(offer_name, 0.0)
+                - history_penalty.get(offer_name, 0.0)
+            )
 
     if float(customer_data["CreditScore"]) >= 650:
         offer_scores.pop("advisor_callback", None)
@@ -614,15 +741,12 @@ def give_offer(
     top_offer_probabilities = softmax_dict(
         {offer_name: float(available_offer[offer_name]) for offer_name in top_offer_pool}
     )
-    chosen_offers = RNG.choice(
-        top_offer_pool,
-        size=selection_size,
-        replace=False,
-        p=np.array([top_offer_probabilities[offer_name] for offer_name in top_offer_pool], dtype=float),
-    )
-    offers_importance = {
-        offer_name: float(top_offer_probabilities[offer_name]) for offer_name in chosen_offers
-    }
+    
+    chosen_offers, offers_importance = safe_sample(
+    items=top_offer_pool,
+    scores=available_offer,   # use scores for softmax
+    k=selection_size,
+    rng=RNG)
     chosen_offer_scores = {offer_name: float(available_offer[offer_name]) for offer_name in chosen_offers}
     offer_rankings = [
         {
@@ -705,7 +829,7 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
 def process_feedback(
     latest_result: dict[str, Any],
     accepted_offer: bool,
-    feedback_text: str,
+    feedback_reason: str
 ) -> dict[str, Any]:
     customer_id = latest_result["customer_id"]
     customer_data = fetch_customer_record(customer_id)
@@ -735,22 +859,29 @@ def process_feedback(
         accepted_offer=accepted_offer,
     )
 
-    state = update_offer_weights(
-        state,
+    batch_store = st.session_state.setdefault("batch_updates", [])
+    batch_store.append(
         {
             "pre_rec": serialize_series(pre_rec),
             "cur_rec": serialize_series(cur_rec),
             "pre_churn": pre_churn,
             "current_churn": current_churn,
             "offer_given": offer_given,
-        },
+            "accepted_offer": int(accepted_offer),
+            "feedback_reason": feedback_reason
+        }
     )
-    append_parameters_snapshot(state, reason="feedback_update", customer_id=customer_id)
 
-    assessment = critic_score(float(latest_result["churn_risk"]), accepted_offer, feedback_text)
-    latest_result["critic"] = assessment
+    if len(batch_store) >= BATCH_SIZE:
+        for update in batch_store:
+            state = update_offer_weights(state, update)
+            state = update_feature_weights(state, update)   # ✅ NEW
+
+        append_parameters_snapshot(state, reason="batch_update", customer_id=customer_id)
+        batch_store.clear()
+
+    latest_result["critic"] = {"score": None,"status": "removed (using reward-based learning)"}
     latest_result["post_offer_churn"] = round(current_churn, 4)
-    latest_result["feedback_notes"] = feedback_text
 
     if not accepted_offer:
         replacement_offer = give_offer(
@@ -791,7 +922,7 @@ def process_feedback(
 
 
 st.title("Bank Customer Retention Learning Agent")
-st.caption("Performance element + learning element + critic on top of the existing churn model.")
+st.caption("Performance element + learning element with reward-based feedback on top of the churn model.")
 
 with st.expander("Project Structure", expanded=False):
     st.markdown(
@@ -867,7 +998,69 @@ with agent_tab: #-? This tab still needs UX review if you want to change the age
     st.subheader("Analyze an existing customer")
     st.write("Use a `CustomerId` from `Churn_Modelling.csv`, for example `15634602`.")
 
-    customer_id = st.text_input("Customer ID", value="15634602")
+    customer_ids = sorted(customer_df["CustomerId"].astype(str).unique())
+    customer_id = st.selectbox("Customer ID", customer_ids, index=0)
+with st.expander("Parameter Visualizer", expanded=False):
+    if PARAMETERS_CSV_PATH.exists():
+        params_df = pd.read_csv(PARAMETERS_CSV_PATH)
+
+        if not params_df.empty:
+            params_df["feature_weights"] = params_df["feature_weights"].apply(json.loads)
+            params_df["offer_weights"] = params_df["offer_weights"].apply(json.loads)
+
+            # ---------- Create batch index (X-axis fix) ----------
+            params_df["batch_step"] = range(1, len(params_df) + 1)
+
+            # ---------- Feature weights trend ----------
+            fw_df = pd.json_normalize(params_df["feature_weights"])
+            fw_df["batch_step"] = params_df["batch_step"]
+
+            st.subheader("Feature Weights Evolution")
+            st.line_chart(fw_df.set_index("batch_step"))
+
+            # ---------- Offer weights (latest heatmap style table) ----------
+            st.subheader("Current Offer Strategy")
+            latest_offer = pd.DataFrame(params_df.iloc[-1]["offer_weights"])
+            st.dataframe(latest_offer.style.format("{:.2f}"))
+
+            # ---------- Delta (change in last batch) ----------
+            if len(params_df) > 1:
+                prev_offer = pd.DataFrame(params_df.iloc[-2]["offer_weights"])
+                curr_offer = pd.DataFrame(params_df.iloc[-1]["offer_weights"])
+
+                delta_offer = (curr_offer - prev_offer).round(3)
+
+                st.subheader("Recent Learning Update (Δ weights)")
+                st.dataframe(delta_offer)
+
+                # ---------- Feature delta ----------
+                prev_feature = params_df.iloc[-2]["feature_weights"]
+                curr_feature = params_df.iloc[-1]["feature_weights"]
+
+                delta_feature = {
+                    k: round(float(curr_feature[k]) - float(prev_feature[k]), 4)
+                    for k in curr_feature
+                }
+
+                st.subheader("Feature Importance Change")
+                st.json(delta_feature)
+
+            # ---------- Quick insights ----------
+            if len(params_df) > 1:
+                st.subheader("Key Insights")
+
+                # strongest feature
+                latest_fw = params_df.iloc[-1]["feature_weights"]
+                top_feature = max(latest_fw, key=lambda x: abs(latest_fw[x]))
+
+                # most changed offer weight
+                if len(params_df) > 1:
+                    change_abs = delta_offer.abs()
+                    max_change = change_abs.stack().idxmax()
+
+                    st.write(f"• Most influential feature: **{top_feature}**")
+                    st.write(f"• Largest update: **{max_change[1]} → {max_change[0]}**")
+
     customer_query = st.text_area(
         "Agent Query",
         value="Analyze the customer, estimate churn risk, and recommend retention actions.",
@@ -887,26 +1080,131 @@ with agent_tab: #-? This tab still needs UX review if you want to change the age
         try:
             result = analyze_customer(customer_id.strip(), customer_query.strip())
             st.session_state["latest_agent_result"] = result
-            st.json(result)
+            st.subheader("Churn Risk")
+            st.write(result["churn_risk"])
+
+            st.subheader("Insights")
+            for insight in result["insights"]:
+                st.write("•", insight)
+
+            st.subheader("Recommended Offer")
+            st.write(result["recommended_actions"][0])   # main offer
+
+            st.subheader("Suggested Improvements")
+            for action in result["recommended_actions"][1:]:
+                st.write("•", action)
         except Exception as exc:
             st.error(str(exc))
 
     latest_result = st.session_state.get("latest_agent_result")
     if latest_result:
-        st.subheader("Critic Feedback")
-        accepted_offer = st.checkbox("Customer accepted the proposed offer", value=False)
-        feedback_text = st.text_area("Feedback Notes", height=80)
+        st.subheader("Feedback")
 
-        if st.button("Submit Feedback"):
+        # ---------- FEEDBACK UI ----------
+        st.subheader("Customer Feedback")
+
+        col1, col2 = st.columns([2, 3])
+
+        # ---------- Acceptance (clean UX) ----------
+        with col1:
+            response = st.radio(
+                "Customer Response",
+                ["Accepted", "Rejected"],
+                horizontal=True
+            )
+            accepted_offer = (response == "Accepted")
+
+        # ---------- Structured feedback ----------
+        with col2:
+            feedback_reason = st.selectbox(
+                "Feedback Reason",
+                [
+                    "Liked benefits",
+                    "Too expensive",
+                    "Not relevant",
+                    "Prefers other offer",
+                    "No clear reason"
+                ]
+            )
+
+
+        # ---------- Single action button ----------
+        if st.button("Update & Learn", use_container_width=True):
             try:
-                updated_result = process_feedback(latest_result, accepted_offer, feedback_text)
+                updated_result = process_feedback(latest_result,accepted_offer,feedback_reason)
+
                 st.session_state["latest_agent_result"] = updated_result
-                status_text = updated_result["critic"]["status"]
-                score_text = updated_result["critic"]["score"]
-                st.success(f"Critic recorded feedback with status `{status_text}` and score `{score_text}`.")
+
+                st.success("Feedback recorded and learning updated.")
+
                 if not accepted_offer:
-                    st.info("A replacement offer has been generated and stored back into observation for continued learning.")
-                st.json(updated_result)
+                    st.info("A replacement offer has been generated.")
+
+                st.subheader("Updated Customer Status")
+
+                # ---------- 1. Churn ----------
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.metric(
+                        "Churn Risk (Before)",
+                        f"{updated_result['churn_risk']:.3f}"
+                    )
+
+                with col2:
+                    st.metric(
+                        "Churn Risk (After)",
+                        f"{updated_result['post_offer_churn']:.3f}",
+                        delta=round(updated_result['post_offer_churn'] - updated_result['churn_risk'], 4)
+                    )
+
+                # ---------- 2. Insights ----------
+                st.subheader("Key Insights")
+                for insight in updated_result["insights"]:
+                    st.write("•", insight)
+
+                # ---------- 3. Main Offer ----------
+                st.subheader("Recommended Offer")
+                st.success(updated_result["recommended_actions"][0])
+
+                # ---------- 4. Improvements ----------
+                st.subheader("Focus Areas")
+                for action in updated_result["recommended_actions"][1:]:
+                    st.write("•", action)
+
+                # ---------- 5. Offer Breakdown ----------
+                st.subheader("Offer Strategy Breakdown")
+
+                offer_df = pd.DataFrame([
+                    {
+                        "Offer": o["label"],
+                        "Score": round(o["score"], 2),
+                        "Probability": round(o["probability"], 4)
+                    }
+                    for o in updated_result["offer_context"]["offer_rankings"]
+                ])
+
+                st.dataframe(offer_df, use_container_width=True)
+
+                # ---------- 6. Selected Features ----------
+                st.subheader("Key Drivers")
+
+                feature_df = pd.DataFrame({
+                    "Feature": list(updated_result["offer_context"]["selected_feature_scores"].keys()),
+                    "Importance": list(updated_result["offer_context"]["selected_feature_scores"].values())
+                })
+
+                st.bar_chart(feature_df.set_index("Feature"))
+
+                # ---------- 7. Learning Feedback ----------
+                st.subheader("Learning Update")
+
+                st.info("System updated using customer feedback.")
+
+                if updated_result["post_offer_churn"] < updated_result["churn_risk"]:
+                    st.success("Retention strategy improved churn risk.")
+                else:
+                    st.warning("No improvement observed. System will adapt next iteration.")
             except Exception as exc:
                 st.error(str(exc))
 st.markdown("Built with Streamlit, TensorFlow, and LangChain.")
