@@ -138,7 +138,7 @@ def serialize_series(series: pd.Series) -> dict[str, float]:
 
 
 #CHURN PREDICTOR###################
-def predict_churn_from_learning_vector(customer_data: dict[str, Any], learning_vector: pd.Series) -> float:
+def predict_churn_(customer_data: dict[str, Any], learning_vector: pd.Series) -> float:
     updated_customer = dict(customer_data)
     for feature, value in learning_vector.items():
         if feature in {"NumOfProducts", "HasCrCard", "IsActiveMember"}:
@@ -204,7 +204,7 @@ def load_learning_state() -> dict[str, Any]:
         append_parameters_snapshot(state, reason="initialize")
         return state
 
-# taking latest parameters for giving offers################################################
+    # taking latest parameters for giving offers################################################
     latest = state_frame.iloc[-1]
     try:
         state = {
@@ -212,7 +212,7 @@ def load_learning_state() -> dict[str, Any]:
             "offer_weights": json.loads(latest["offer_weights"]),
             "retained_mean": json.loads(latest["retained_mean"]),
         }
-    #If in case, no features in .csv
+    #If incase no features in .csv
     except Exception:
         state = initialize_learning_state()
         append_parameters_snapshot(state, reason="reinitialize")
@@ -401,7 +401,7 @@ def fetch_customer_record(customer_id: str) -> dict[str, Any] | None:
     return base_record
 
 
-#INSIGHTS FOR A CUSTOMER##################################
+#INSIGHTS FOR A CUSTOMER(Hardcoded based on prior knowledge just for intution)##################################
 def build_insights(customer_data: dict[str, Any], probability: float) -> list[str]:
     insights: list[str] = []
     if float(customer_data["Balance"]) < 50000:
@@ -667,7 +667,7 @@ def get_customer_offer_history(customer_id: str) -> list[dict[str, Any]]:
         return []
     return history.tail(5).to_dict("records")
 
-#SELECTING OFFERS ON WHICH OFFER TEXT WILL BE GENERATED##########################
+#SELECTING FEATURES BASED ON THEIR DIFFERENCE FROM TARGET(EXPECTED VALUES FOR RETAINED CUSTOMER) ##########################
 def select_offer_features(
     required_gap: pd.Series,
     feature_weights: pd.Series,
@@ -679,14 +679,14 @@ def select_offer_features(
         if feature in excluded:
             continue
         gap = float(required_gap.get(feature, 0.0))
-        score = gap * float(feature_weights.get(feature, 0.0))
+        score = gap * float(feature_weights.get(feature, 0.0)) # larger the gap, focus more on that feature
         candidate_scores[feature] = score
     if not candidate_scores:
         fallback = (required_gap[ACTIONABLE_FEATURES] * feature_weights.reindex(ACTIONABLE_FEATURES).fillna(0.0)).sort_values(ascending=False)
         return [str(feature) for feature in fallback.index[:2]]
-    sample_size = min(3, len(candidate_scores))
+    sample_size = min(3, len(candidate_scores)) # 3 features are selected
     features = list(candidate_scores)
-    probabilities = softmax_dict(candidate_scores)
+    # probabilities = softmax_dict(candidate_scores) # Converting focus into probability
     
     selected, _ = safe_selection(
     items=features,
@@ -696,7 +696,9 @@ def select_offer_features(
 
     return [str(feature) for feature in selected]
 
-
+#FUNCTION
+# considers whether previous offer was rejected or not
+# OFFERS ARE SELECTED IN THIS CODE ONLY
 def give_offer(
     customer_data: dict[str, Any],
     churn_rate: float,
@@ -712,10 +714,12 @@ def give_offer(
     if not selected_features:
         selected_features = ACTIONABLE_FEATURES[:2]
 
-    selected_feature_scores = {
+    selected_feature_scores = { # gap * feature weight
         feature: float(required_gap.get(feature, 0.0)) * float(feature_weights.get(feature, 0.0))
         for feature in selected_features
     }
+    # Below is caculated how many previous offers were rejected and how many were not
+    # These helps in telling which offers actually user finds useful and which are not relevant to user
     history = get_customer_offer_history(customer_data["CustomerId"])
     history_bonus = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
     history_penalty = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
@@ -730,10 +734,9 @@ def give_offer(
 
     offer_scores = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
     for feature in selected_features:
-        gap = float(required_gap.get(feature, 0.0))
-        feature_weight = float(feature_weights.get(feature, 0.0))
         for offer_name, weight in state["offer_weights"][feature].items():
-            base = gap * feature_weight * float(weight)
+            base = selected_feature_scores[feature] * float(weight)
+            # Here history offer is influencing offer scores
             offer_scores[offer_name] += (
                 base
                 + history_bonus.get(offer_name, 0.0)
@@ -752,6 +755,7 @@ def give_offer(
     if not available_offer:
         available_offer = offer_scores
 
+    # Making offer scores into probability for selecting 2 of them
     available_offer_probabilities = softmax_dict(available_offer)
     ranked_offers = sorted(
         available_offer_probabilities,
@@ -760,10 +764,11 @@ def give_offer(
     )
     top_offer_pool = ranked_offers[: min(3, len(ranked_offers))]
     selection_size = min(2, len(top_offer_pool))
-    top_offer_probabilities = softmax_dict(
-        {offer_name: float(available_offer[offer_name]) for offer_name in top_offer_pool}
-    )
+    # top_offer_probabilities = softmax_dict(
+    #     {offer_name: float(available_offer[offer_name]) for offer_name in top_offer_pool}
+    # )
     
+    # Here also safe_selection is used to select offers(before it was used for feature selection also)
     chosen_offers, offers_importance = safe_selection(
         items=top_offer_pool,
         scores=available_offer,
@@ -780,6 +785,8 @@ def give_offer(
         }
         for offer_name in ranked_offers
     ]
+
+    #This offer string will be used if LLM doesn't work properly to generate text
     offer_string = generate_offer_text(
         customer_data=customer_data,
         churn_rate=churn_rate,
@@ -810,9 +817,13 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
 
     probability = predict_churn(customer_data)
     insights = build_insights(customer_data, probability)
+    # state contains parameters values
     state = load_learning_state()
+    # offer_payload gets offers selected with their probabilities and scores
     offer_payload = give_offer(customer_data, probability, state)
 
+    # Here offer is sent and observe change in customer behaviour(acceptence and feedback)
+    # When accepted/Not accepted and feedback is submitted it removes from observation
     store_in_observation(
         customer_id,
         {
@@ -827,6 +838,7 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
         },
     )
 
+    # this string is used when LLM is not working
     recommended_actions = [offer_payload["offer_string"]]
     recommended_actions.extend(
         f"Prioritize {feature} improvement for this customer." for feature in offer_payload["selected_features"]
@@ -848,7 +860,8 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
         },
     }
 
-
+#When gets feedback then this function is called and customer is removed from observation and whatever customer behaviour change was observed is stored to update.csv
+# Assuming offer is rejected then it stores customer behaviour in update.csv again stores it in observation 
 def process_feedback(
     latest_result: dict[str, Any],
     accepted_offer: bool,
@@ -869,7 +882,7 @@ def process_feedback(
     pre_churn = float(observation["pre_churn"])
     offer_given = {key: float(value) for key, value in observation["offer_given"].items()}
     cur_rec = simulate_post_offer_record(pre_rec, retained_mean, offer_given, accepted_offer, state)
-    current_churn = predict_churn_from_learning_vector(customer_data, cur_rec)
+    current_churn = predict_churn_(customer_data, cur_rec)# gives churn for customer data after offer
 
     add_to_updated_csv(
         pre_rec=pre_rec,
@@ -898,7 +911,7 @@ def process_feedback(
     if len(batch_store) >= BATCH_SIZE:
         for update in batch_store:
             state = update_offer_weights(state, update)
-            state = update_feature_weights(state, update)   # ✅ NEW
+            state = update_feature_weights(state, update)
 
         append_parameters_snapshot(state, reason="batch_update", customer_id=customer_id)
         batch_store.clear()
@@ -906,12 +919,13 @@ def process_feedback(
     latest_result["critic"] = {"score": None,"status": "removed (using reward-based learning)"}
     latest_result["post_offer_churn"] = round(current_churn, 4)
 
+    # new offer and don't consider previously given offers.
     if not accepted_offer:
         replacement_offer = give_offer(
             customer_data,
             current_churn,
             state,
-            excluded_offers=set(offer_given),
+            excluded_offers=set(offer_given),# here the very next offer is not containing same offer(this avoids repetative offer to customer) but it may include offers in next-to-next offers
             previous_one_rejected=1,
         )
         store_in_observation(
@@ -927,8 +941,8 @@ def process_feedback(
                 "created_at": datetime.utcnow().isoformat(),
             },
         )
-        latest_result["recommended_actions"] = [replacement_offer["offer_string"]]
-        latest_result["recommended_actions"].extend(
+        latest_result["recommended_actions"] = [replacement_offer["offer_string"]]# Reset to new offers
+        latest_result["recommended_actions"].extend( # New recommended actions
             f"Follow up through {label}." for label in replacement_offer["offer_labels"]
         )
         latest_result["offer_context"] = {
