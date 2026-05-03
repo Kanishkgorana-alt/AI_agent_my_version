@@ -1,126 +1,93 @@
-# Customer Churn Prediction using Artificial Neural Networks (ANN)
+🚀 Customer Retention Learning Agent using AI
 
-This project builds an end-to-end machine learning pipeline to predict whether a bank customer is likely to **churn (exit)**.
-It covers data cleaning, feature engineering, model training, evaluation, and deployment through an interactive Streamlit application.
 
----
 
-## 1 Project Overview
 
-Customer churn is a critical problem for financial institutions. Accurately identifying customers at risk enables better retention strategies and improved business outcomes.
 
-This project demonstrates:
 
-- End-to-end ML workflow
-- Practical feature preprocessing
-- ANN-based binary classification
-- Deployment for real-time predictions
+An AI-driven system that predicts customer churn and generates personalized retention offers.
+The system learns from customer feedback (accept/reject) and continuously improves its decisions using a learning agent architecture.
 
----
+📌 Project Description
 
-## 2 Dataset Summary
+Customer churn is a major problem in banking. This project goes beyond prediction by building an adaptive decision system that:
 
-Each record represents a customer with features such as:
+Predicts churn probability using a neural network
+Identifies key features affecting churn
+Generates targeted retention offers
+Learns from feedback to improve future decisions
 
-- Geography, Gender
-- Age, Tenure
-- Balance, Estimated Salary
-- Credit Score
-- Number of Products
-- Has Credit Card
-- Is Active Member
+The system follows a continuous loop:
 
-**Target variable:**
-`Exited` -> `0` (stays) or `1` (churns)
-
----
-
-## 3 Model Architecture
-
-The predictive model is built using **TensorFlow/Keras**:
-
-- Input layer (processed numeric + encoded categorical variables)
-- Two hidden layers with ReLU activation
-- Output layer with Sigmoid activation
-
-**Training details:**
-
-- Loss: Binary Crossentropy
-- Optimizer: Adam
-- Regular evaluation on validation data
-- Early stopping to prevent overfitting
-
----
-
-## 4 Evaluation Metrics
-
-Performance is assessed using:
-
-- Accuracy
-- Precision and Recall
-- Confusion Matrix
-- Churn probability outputs
-
----
-
-## 5 Streamlit Application
-
-The web app allows users to input customer details and receive:
-
-- Predicted churn probability
-- Clear interpretation of the result
-
----
-
-## 6 Project Structure
-
-- `app.py`: Streamlit application
-- `experiments.ipynb`: model training notebook
-- `prediction.ipynb`: prediction and testing
-- `model.h5`: trained model
-- `requirements.txt`
-- `runtime.txt`
-
----
-
-## 7 Technology Stack
-
-- Python
-- Pandas, NumPy
-- Scikit-learn
-- TensorFlow / Keras
-- Streamlit
-
----
-
-## 8 Key Takeaways
-
-This project highlights how deep learning can be applied to real-world business problems and deployed for actionable decision support.
-
----
-
-## 9 Local Run With venv
-
-Create and activate a virtual environment, then install dependencies:
-
-```powershell
+Observe → Decide → Act → Learn → Improve
+⚙️ Installation Steps
+1. Clone the repository
+git clone https://github.com/your-username/your-repo.git
+cd your-repo
+2. Create virtual environment
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+3. Activate environment
+
+Windows
+
+.venv\Scripts\activate
+
+Linux / Mac
+
+source .venv/bin/activate
+4. Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
-```
+▶️ How to Run the Project
 
-Run the Streamlit app:
+Start the Streamlit app:
 
-```powershell
 streamlit run app.py
-```
 
-The app will be available at `http://localhost:8501`.
+Open in browser:
 
-Runtime configuration:
+http://localhost:8501
+📥 Example Input / Output
+Example Input
+Customer Details:
+- Credit Score: 650
+- Geography: France
+- Age: 40
+- Balance: 60000
+- Number of Products: 1
+- Is Active Member: Yes
+Example Output
+Churn Probability: 0.78 (High Risk)
 
-- Provide `GROQ_API_KEY` through `.env` or your shell environment.
-- Keep `Churn_Modelling.csv`, model assets, and the `logs/` directory in the project root.
+Selected Features to Improve:
+- Balance
+- Activity
 
----
+Recommended Offer:
+- Cashback bonus on card usage
+
+Explanation:
+Customer shows low engagement and moderate balance.
+Cashback incentives may increase activity and retention.
+📁 Project Structure
+├── app.py
+├── models/
+├── utils/
+├── logs/
+│   ├── update_history.csv
+│   └── parameters.csv
+├── Churn_Modelling.csv
+├── requirements.txt
+🧠 Key Features
+Machine learning-based churn prediction
+Learning agent architecture
+Feedback-driven updates
+Personalized offer generation
+Real-time Streamlit interface
+🧾 Notes
+Ensure dataset (Churn_Modelling.csv) is present
+logs/ folder is required for storing updates
+Run inside virtual environment for best results
+📌 Summary
+
+This project demonstrates how AI can move from prediction → decision-making → continuous learning, making it highly applicable for real-world customer retention systems.

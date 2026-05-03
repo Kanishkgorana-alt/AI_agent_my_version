@@ -37,6 +37,19 @@ DATA_PATH = BASE_DIR / "Churn_Modelling.csv"
 MODEL_PATH = BASE_DIR / "model.h5"
 UPDATE_CSV_PATH = BASE_DIR / "logs" / "update_history.csv"
 PARAMETERS_CSV_PATH = BASE_DIR / "logs" / "parameters.csv"
+UPDATE_HISTORY_COLUMNS = [
+    "timestamp",
+    "customer_id",
+    "pre_rec",
+    "cur_rec",
+    "pre_churn",
+    "current_churn",
+    "offer_given",
+    "offer_string",
+    "accepted_offer",
+    "feedback_reason",
+    "offer_attempt",
+]
 
 #FEATURES WHICH ARE EXPECTED TO CHANGE BY GIVING OFFER#####################################################################################################
 ACTIONABLE_FEATURES = [
@@ -239,6 +252,10 @@ def store_in_observation(customer_id: str, observation_payload: dict[str, Any]) 
 
 def remove_from_observation(customer_id: str) -> dict[str, Any] | None:
     return get_observation_store().pop(customer_id, None)
+
+
+def peek_observation(customer_id: str) -> dict[str, Any] | None:
+    return get_observation_store().get(customer_id)
 
 
 #USED TO SCALING PARAMETERS TO PROBABILITY FOR SELECTION
@@ -550,6 +567,8 @@ def add_to_updated_csv(
     offer_string: str,
     customer_id: str,
     accepted_offer: bool,
+    feedback_reason: str = "",
+    offer_attempt: int = 1,
 ) -> None:
     payload = {
         "timestamp": datetime.utcnow().isoformat(),
@@ -561,12 +580,23 @@ def add_to_updated_csv(
         "offer_given": json.dumps({k: float(v) for k, v in offer_given.items()}),
         "offer_string": offer_string,
         "accepted_offer": int(accepted_offer),
+        "feedback_reason": feedback_reason,
+        "offer_attempt": int(offer_attempt),
     }
     update_frame = pd.DataFrame([payload])
     UPDATE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     if UPDATE_CSV_PATH.exists():
+        existing_frame = pd.read_csv(UPDATE_CSV_PATH)
+        for column in UPDATE_HISTORY_COLUMNS:
+            if column not in existing_frame.columns:
+                existing_frame[column] = ""
+        extra_columns = [column for column in existing_frame.columns if column not in UPDATE_HISTORY_COLUMNS]
+        existing_frame = existing_frame[UPDATE_HISTORY_COLUMNS + extra_columns]
+        existing_frame.to_csv(UPDATE_CSV_PATH, index=False)
+        update_frame = update_frame.reindex(columns=existing_frame.columns, fill_value="")
         update_frame.to_csv(UPDATE_CSV_PATH, mode="a", header=False, index=False)
     else:
+        update_frame = update_frame.reindex(columns=UPDATE_HISTORY_COLUMNS, fill_value="")
         update_frame.to_csv(UPDATE_CSV_PATH, index=False)
 
 #SIMULATE CUSTOMER BANK DETAIL CHANGES DUE TO OFFER#############################################
@@ -833,6 +863,7 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
             "offer_given": offer_payload["offers_importance"],
             "offer_string": offer_payload["offer_string"],
             "selected_features": offer_payload["selected_features"],
+            "offer_attempt": 1,
             "customer_query": customer_query,
             "created_at": datetime.utcnow().isoformat(),
         },
@@ -858,6 +889,14 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
             "offer_rankings": offer_payload["offer_rankings"],
             "offer_labels": offer_payload["offer_labels"],
         },
+        "feedback_status": {
+            "accepted_offer": None,
+            "feedback_reason": "",
+            "replacement_generated": False,
+            "replacement_limit_reached": False,
+            "interaction_complete": False,
+            "offer_attempt": 1,
+        },
     }
 
 #When gets feedback then this function is called and customer is removed from observation and whatever customer behaviour change was observed is stored to update.csv
@@ -876,6 +915,7 @@ def process_feedback(
     observation = remove_from_observation(customer_id)
     if observation is None:
         raise ValueError("No active observation found for this customer. Analyze the customer again before submitting feedback.")
+    offer_attempt = int(observation.get("offer_attempt", 1))
 
     pre_rec = pd.Series(observation["pre_rec"], dtype=float)
     retained_mean = pd.Series(state["retained_mean"], dtype=float)
@@ -893,6 +933,8 @@ def process_feedback(
         offer_string=observation["offer_string"],
         customer_id=customer_id,
         accepted_offer=accepted_offer,
+        feedback_reason=feedback_reason,
+        offer_attempt=offer_attempt,
     )
 
     batch_store = st.session_state.setdefault("batch_updates", [])
@@ -918,9 +960,17 @@ def process_feedback(
 
     latest_result["critic"] = {"score": None,"status": "removed (using reward-based learning)"}
     latest_result["post_offer_churn"] = round(current_churn, 4)
+    latest_result["feedback_status"] = {
+        "accepted_offer": bool(accepted_offer),
+        "feedback_reason": feedback_reason,
+        "replacement_generated": False,
+        "replacement_limit_reached": False,
+        "interaction_complete": bool(accepted_offer),
+        "offer_attempt": offer_attempt,
+    }
 
     # new offer and don't consider previously given offers.
-    if not accepted_offer:
+    if not accepted_offer and offer_attempt == 1:
         replacement_offer = give_offer(
             customer_data,
             current_churn,
@@ -937,6 +987,7 @@ def process_feedback(
                 "offer_given": replacement_offer["offers_importance"],
                 "offer_string": replacement_offer["offer_string"],
                 "selected_features": replacement_offer["selected_features"],
+                "offer_attempt": 2,
                 "customer_query": latest_result.get("customer_query", ""),
                 "created_at": datetime.utcnow().isoformat(),
             },
@@ -954,26 +1005,387 @@ def process_feedback(
             "offer_labels": replacement_offer["offer_labels"],
             "previous_one_rejected": 1,
         }
+        latest_result["feedback_status"] = {
+            "accepted_offer": False,
+            "feedback_reason": feedback_reason,
+            "replacement_generated": True,
+            "replacement_limit_reached": False,
+            "interaction_complete": False,
+            "offer_attempt": 2,
+            "rejected_offer": observation["offer_string"],
+            "rejected_offer_keys": list(offer_given),
+        }
+    elif not accepted_offer:
+        latest_result["recommended_actions"] = [
+            "Replacement offer was rejected. Stop automated offers for this interaction and escalate to advisor review."
+        ]
+        latest_result["recommended_actions"].append(
+            "Review customer feedback before proposing another retention offer."
+        )
+        latest_result["offer_context"] = {
+            **latest_result.get("offer_context", {}),
+            "previous_one_rejected": 1,
+            "replacement_limit_reached": True,
+        }
+        latest_result["feedback_status"] = {
+            "accepted_offer": False,
+            "feedback_reason": feedback_reason,
+            "replacement_generated": False,
+            "replacement_limit_reached": True,
+            "interaction_complete": True,
+            "offer_attempt": offer_attempt,
+            "rejected_offer": observation["offer_string"],
+            "rejected_offer_keys": list(offer_given),
+        }
 
     return latest_result
+
+
+def render_offer_strategy(offer_context: dict[str, Any]) -> None:
+    selected_offer_weights = {
+        offer_name: float(weight)
+        for offer_name, weight in offer_context.get("offers_importance", {}).items()
+    }
+    selected_feature_scores = {
+        feature: float(score)
+        for feature, score in offer_context.get("selected_feature_scores", {}).items()
+    }
+    selected_features = offer_context.get("selected_features", list(selected_feature_scores))
+    offer_scores = offer_context.get("offer_scores", {})
+    offer_rankings = offer_context.get("offer_rankings", [])
+
+    st.markdown("**Selected offers**")
+    if selected_offer_weights:
+        selected_offer_df = pd.DataFrame(
+            [
+                {
+                    "Offer Key": offer_name,
+                    "Offer": OFFER_LIBRARY.get(offer_name, offer_name),
+                    "Selection Weight": round(weight, 4),
+                    "Score": round(float(offer_scores.get(offer_name, 0.0)), 4),
+                }
+                for offer_name, weight in selected_offer_weights.items()
+            ]
+        )
+        st.dataframe(selected_offer_df, width="stretch", hide_index=True)
+    else:
+        st.caption("No offer was selected for this strategy.")
+
+    st.markdown("**Selected feature drivers**")
+    if selected_feature_scores:
+        feature_df = pd.DataFrame(
+            [
+                {
+                    "Feature": feature,
+                    "Importance": round(float(selected_feature_scores.get(feature, 0.0)), 4),
+                }
+                for feature in selected_features
+            ]
+        )
+        st.dataframe(feature_df, width="stretch", hide_index=True)
+        st.bar_chart(feature_df.set_index("Feature"))
+    else:
+        st.caption("No feature driver was selected for this strategy.")
+
+    if offer_rankings:
+        st.markdown("**Full offer ranking**")
+        offer_df = pd.DataFrame(
+            [
+                {
+                    "Selected": "Yes" if offer.get("offer_name") in selected_offer_weights else "",
+                    "Offer Key": offer.get("offer_name", ""),
+                    "Offer": offer.get("label", ""),
+                    "Score": round(float(offer.get("score", 0.0)), 4),
+                    "Probability": round(float(offer.get("probability", 0.0)), 4),
+                }
+                for offer in offer_rankings
+            ]
+        )
+        st.dataframe(offer_df, width="stretch", hide_index=True)
+
+
+def render_result_summary(result: dict[str, Any]) -> None:
+    st.subheader("Churn Risk")
+    churn_risk = float(result["churn_risk"])
+    if "post_offer_churn" in result:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Before Offer", f"{churn_risk:.3f}")
+        with col2:
+            post_offer_churn = float(result["post_offer_churn"])
+            st.metric(
+                "After Offer",
+                f"{post_offer_churn:.3f}",
+                delta=round(post_offer_churn - churn_risk, 4),
+            )
+    else:
+        st.metric("Churn Probability", f"{churn_risk:.3f}")
+        st.progress(max(0.0, min(1.0, churn_risk)))
+
+    st.subheader("Insights")
+    for insight in result.get("insights", []):
+        st.write("-", insight)
+
+    actions = result.get("recommended_actions", [])
+    if actions:
+        feedback_status = result.get("feedback_status", {})
+        offer_context = result.get("offer_context", {})
+        replacement_limit_reached = bool(
+            feedback_status.get("replacement_limit_reached")
+            or offer_context.get("replacement_limit_reached")
+        )
+        replacement_generated = bool(feedback_status.get("replacement_generated"))
+        is_replacement_offer = bool(offer_context.get("previous_one_rejected")) and not replacement_limit_reached
+        if replacement_limit_reached:
+            st.warning("Replacement offer was rejected. No more automated offers will be generated for this interaction.")
+        if replacement_generated:
+            st.info("Previous offer was rejected. A replacement offer has been generated.")
+        if replacement_limit_reached:
+            offer_heading = "Advisor Review"
+        elif replacement_generated or is_replacement_offer:
+            offer_heading = "Replacement Offer"
+        else:
+            offer_heading = "Recommended Offer"
+        st.subheader(offer_heading)
+        if replacement_limit_reached:
+            st.warning(actions[0])
+        else:
+            st.success(actions[0])
+
+    if len(actions) > 1:
+        st.subheader("Focus Areas")
+        for action in actions[1:]:
+            st.write("-", action)
+
+    offer_context = result.get("offer_context")
+    if offer_context:
+        st.subheader("Offer Strategy")
+        render_offer_strategy(offer_context)
+
+
+def render_parameter_visualizer() -> None:
+    with st.expander("Parameter Visualizer", expanded=False):
+        if not PARAMETERS_CSV_PATH.exists():
+            st.caption("No parameter snapshots are available yet.")
+            return
+
+        params_df = pd.read_csv(PARAMETERS_CSV_PATH)
+        if params_df.empty:
+            st.caption("No parameter snapshots are available yet.")
+            return
+
+        params_df["feature_weights"] = params_df["feature_weights"].apply(json.loads)
+        params_df["offer_weights"] = params_df["offer_weights"].apply(json.loads)
+        params_df["batch_step"] = range(1, len(params_df) + 1)
+
+        fw_df = pd.json_normalize(params_df["feature_weights"])
+        fw_df["batch_step"] = params_df["batch_step"]
+        st.subheader("Feature Weights Evolution")
+        st.line_chart(fw_df.set_index("batch_step"))
+
+        st.subheader("Current Offer Strategy")
+        latest_offer = pd.DataFrame(params_df.iloc[-1]["offer_weights"])
+        st.dataframe(latest_offer.style.format("{:.2f}"))
+
+        if len(params_df) <= 1:
+            return
+
+        prev_offer = pd.DataFrame(params_df.iloc[-2]["offer_weights"])
+        curr_offer = pd.DataFrame(params_df.iloc[-1]["offer_weights"])
+        delta_offer = (curr_offer - prev_offer).round(3)
+
+        st.subheader("Recent Learning Update (Delta weights)")
+        st.dataframe(delta_offer)
+
+        prev_feature = params_df.iloc[-2]["feature_weights"]
+        curr_feature = params_df.iloc[-1]["feature_weights"]
+        delta_feature = {
+            k: round(float(curr_feature[k]) - float(prev_feature[k]), 4)
+            for k in curr_feature
+        }
+        st.subheader("Feature Importance Change")
+        st.json(delta_feature)
+
+        latest_fw = params_df.iloc[-1]["feature_weights"]
+        top_feature = max(latest_fw, key=lambda x: abs(latest_fw[x]))
+        max_change = delta_offer.abs().stack().idxmax()
+
+        st.subheader("Key Insights")
+        st.write(f"- Most influential feature: **{top_feature}**")
+        st.write(f"- Largest update: **{max_change[1]} -> {max_change[0]}**")
+
+
+def render_learning_agent_ui() -> None:
+    st.title("Bank Customer Retention Learning Agent")
+    st.caption("Performance element + learning element with reward-based feedback on top of the churn model.")
+    st.subheader("Learning Agent")
+
+    with st.expander("Manual Predictor", expanded=False):
+        st.write("Run the same churn and offer strategy pipeline with custom customer inputs.")
+
+        with st.form("manual_predictor_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                geography = st.selectbox("Geography", onehot_encoder_geo.categories_[0], key="manual_geography")
+                gender = st.selectbox("Gender", label_encoder_gender.classes_, key="manual_gender")
+                age = st.slider("Age", 18, 92, key="manual_age")
+                tenure = st.slider("Tenure", 0, 10, key="manual_tenure")
+                balance = st.number_input("Balance", min_value=0.0, key="manual_balance")
+            with col2:
+                credit_score = st.number_input(
+                    "Credit Score",
+                    min_value=300.0,
+                    max_value=900.0,
+                    value=650.0,
+                    key="manual_credit_score",
+                )
+                estimated_salary = st.number_input("Estimated Salary", min_value=0.0, key="manual_estimated_salary")
+                num_of_products = st.slider("Number of Products", 1, 4, key="manual_num_of_products")
+                has_cr_card = st.selectbox("Has Credit Card", [0, 1], key="manual_has_cr_card")
+                is_active_member = st.selectbox("Is Active Member", [0, 1], key="manual_is_active_member")
+            manual_submitted = st.form_submit_button("Predict Churn", width="stretch")
+
+        if manual_submitted:
+            try:
+                manual_customer = {
+                    "CustomerId": "manual_input",
+                    "CreditScore": credit_score,
+                    "Gender": gender,
+                    "Age": age,
+                    "Tenure": tenure,
+                    "Balance": balance,
+                    "NumOfProducts": num_of_products,
+                    "HasCrCard": has_cr_card,
+                    "IsActiveMember": is_active_member,
+                    "EstimatedSalary": estimated_salary,
+                    "Geography": geography,
+                }
+                probability = predict_churn(manual_customer)
+                manual_offer_payload = give_offer(manual_customer, probability, load_learning_state())
+                manual_actions = [manual_offer_payload["offer_string"]]
+                manual_actions.extend(
+                    f"Prioritize {feature} improvement for this customer."
+                    for feature in manual_offer_payload["selected_features"]
+                )
+                st.session_state["latest_manual_result"] = {
+                    "customer_id": "manual_input",
+                    "churn_risk": round(probability, 4),
+                    "insights": build_insights(manual_customer, probability),
+                    "recommended_actions": manual_actions,
+                    "offer_context": {
+                        "selected_features": manual_offer_payload["selected_features"],
+                        "selected_feature_scores": manual_offer_payload["selected_feature_scores"],
+                        "offers_importance": manual_offer_payload["offers_importance"],
+                        "offer_scores": manual_offer_payload["offer_scores"],
+                        "offer_rankings": manual_offer_payload["offer_rankings"],
+                        "offer_labels": manual_offer_payload["offer_labels"],
+                    },
+                }
+            except Exception as exc:
+                st.error(str(exc))
+
+        manual_result = st.session_state.get("latest_manual_result")
+        if manual_result:
+            render_result_summary(manual_result)
+
+    with st.expander("Analyze Existing Customer", expanded=True):
+        st.write("Use a `CustomerId` from `Churn_Modelling.csv`, for example `15634602`.")
+
+        with st.form("existing_customer_form"):
+            customer_ids = sorted(customer_df["CustomerId"].astype(str).unique())
+            customer_id = st.selectbox("Customer ID", customer_ids, index=0)
+            customer_query = st.text_area(
+                "Agent Query",
+                value="Analyze the customer, estimate churn risk, and recommend retention actions.",
+                height=100,
+            )
+            st.caption("Feature selection and offer scoring are computed locally; Groq is used to turn the scored offers into natural-language recommendations when available.")
+            if LANGCHAIN_AVAILABLE and os.getenv("GROQ_API_KEY"):
+                st.caption("Groq offer generation is enabled.")
+                if LANGCHAIN_RUNTIME_ERROR:
+                    st.info(f"Groq status: {LANGCHAIN_RUNTIME_ERROR}")
+            elif LANGCHAIN_AVAILABLE:
+                st.caption("LangChain packages are available, but `GROQ_API_KEY` is missing. Offer text falls back to the local template.")
+            else:
+                st.caption(f"LangChain packages are unavailable: {LANGCHAIN_IMPORT_ERROR}. Offer text falls back to the local template.")
+            analyze_submitted = st.form_submit_button("Analyze Customer", width="stretch")
+
+        if analyze_submitted:
+            try:
+                result = analyze_customer(customer_id.strip(), customer_query.strip())
+                st.session_state["latest_agent_result"] = result
+            except Exception as exc:
+                st.error(str(exc))
+
+        latest_result = st.session_state.get("latest_agent_result")
+        if latest_result:
+            result_slot = st.container()
+            feedback_status = latest_result.get("feedback_status", {})
+            active_observation = peek_observation(latest_result["customer_id"])
+            if active_observation is not None:
+                offer_attempt = int(active_observation.get("offer_attempt", feedback_status.get("offer_attempt", 1)))
+                offer_stage = "Primary Offer" if offer_attempt == 1 else "Replacement Offer"
+                widget_suffix = f"{latest_result['customer_id']}_{offer_attempt}"
+
+                st.subheader(f"{offer_stage} Feedback")
+                if offer_attempt == 2:
+                    st.info("The first offer was rejected. Capture feedback for the replacement offer to complete this interaction.")
+
+                col1, col2 = st.columns([2, 3])
+                with col1:
+                    response = st.radio(
+                        "Customer Response",
+                        ["Accepted", "Rejected"],
+                        horizontal=True,
+                        key=f"feedback_response_{widget_suffix}",
+                    )
+                    accepted_offer = response == "Accepted"
+                with col2:
+                    feedback_reason = st.selectbox(
+                        "Feedback Reason",
+                        [
+                            "Liked benefits",
+                            "Too expensive",
+                            "Not relevant",
+                            "Prefers other offer",
+                            "No clear reason",
+                        ],
+                        key=f"feedback_reason_{widget_suffix}",
+                    )
+
+                if st.button("Update & Learn", width="stretch", key=f"update_learn_{widget_suffix}"):
+                    try:
+                        latest_result = process_feedback(latest_result, accepted_offer, feedback_reason)
+                        st.session_state["latest_agent_result"] = latest_result
+                        updated_status = latest_result.get("feedback_status", {})
+                        if updated_status.get("replacement_generated"):
+                            st.success("Primary offer feedback recorded. Replacement offer is ready for response.")
+                        elif updated_status.get("interaction_complete"):
+                            st.success("Feedback recorded and the interaction is complete.")
+                        else:
+                            st.success("Feedback recorded and learning updated.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                if feedback_status.get("interaction_complete"):
+                    st.info("This customer interaction is complete. No active offer is waiting for feedback.")
+                else:
+                    st.warning("No active offer is waiting for feedback. Analyze the customer again to start a new interaction.")
+
+            with result_slot:
+                render_result_summary(latest_result)
+
+    st.markdown("Built with Streamlit, TensorFlow, and LangChain.")
+
+
+render_learning_agent_ui()
+st.stop()
 
 
 st.title("Bank Customer Retention Learning Agent")
 st.caption("Performance element + learning element with reward-based feedback on top of the churn model.")
 
-with st.expander("Project Structure", expanded=False):
-    st.markdown(
-        "\n".join(
-            [
-                "- `app.py`: Streamlit UI, churn model integration, learning loop, offer updates",
-                "- `Churn_Modelling.csv`: customer profile dataset used as the prototype customer store",
-                "- `model.h5`: trained TensorFlow churn model",
-                "- `label_encoder_gender.pkl`, `onehot_encoder_geo.pkl`, `Scaler.pkl`: preprocessing assets",
-                "- `logs/parameters.csv`: append-only parameter snapshots for feature weights and offer weights",
-                "- `logs/update_history.csv`: recorded customer offer outcomes",
-            ]
-        )
-    )
 manual_tab, agent_tab = st.tabs(["Manual Prediction", "Learning Agent"])
 
 with manual_tab:
@@ -1245,5 +1657,3 @@ with st.expander("Parameter Visualizer", expanded=False):
             except Exception as exc:
                 st.error(str(exc))
 st.markdown("Built with Streamlit, TensorFlow, and LangChain.")
-
-
