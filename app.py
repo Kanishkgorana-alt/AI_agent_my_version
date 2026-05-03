@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Any, cast
 
@@ -82,6 +83,7 @@ OFFER_EFFECTS = {
 }# these are the expected influence of each offer to the features these will be updated affter getting feedback from environment
 
 RNG = np.random.default_rng()
+SAFE_CHURN_MARGIN = 0.01
 
 #BATCH SIZE FOR UPDATING PARAMETERS####################################################################################
 BATCH_SIZE = 5
@@ -154,10 +156,7 @@ def serialize_series(series: pd.Series) -> dict[str, float]:
 def predict_churn_(customer_data: dict[str, Any], learning_vector: pd.Series) -> float:
     updated_customer = dict(customer_data)
     for feature, value in learning_vector.items():
-        if feature in {"NumOfProducts", "HasCrCard", "IsActiveMember"}:
-            updated_customer[feature] = int(round(float(value)))
-        else:
-            updated_customer[feature] = float(value)
+        updated_customer[feature] = float(value)
     return predict_churn(updated_customer)# 0 - retaiined, 1 - exited
 
 #INITIALIZE PARAMETERS######################################################
@@ -386,6 +385,36 @@ def predict_churn(customer_data: dict[str, Any]) -> float:
     prediction = model.predict(scaled_data, verbose=0)
     return float(prediction[0][0])
 
+
+def build_model_input_frame(records: pd.DataFrame) -> pd.DataFrame:
+    encoded_gender = label_encoder_gender.transform(records["Gender"])
+    base_frame = pd.DataFrame(
+        {
+            "CreditScore": records["CreditScore"].astype(float).to_numpy(),
+            "Gender": encoded_gender,
+            "Age": records["Age"].astype(float).to_numpy(),
+            "Tenure": records["Tenure"].astype(float).to_numpy(),
+            "Balance": records["Balance"].astype(float).to_numpy(),
+            "NumOfProducts": records["NumOfProducts"].astype(float).to_numpy(),
+            "HasCrCard": records["HasCrCard"].astype(float).to_numpy(),
+            "IsActiveMember": records["IsActiveMember"].astype(float).to_numpy(),
+            "EstimatedSalary": records["EstimatedSalary"].astype(float).to_numpy(),
+        }
+    )
+    geography_encoded = onehot_encoder_geo.transform(records[["Geography"]]).toarray()
+    geography_frame = pd.DataFrame(
+        geography_encoded,
+        columns=onehot_encoder_geo.get_feature_names_out(["Geography"]),
+    )
+    return pd.concat([base_frame.reset_index(drop=True), geography_frame.reset_index(drop=True)], axis=1)
+
+
+def predict_churn_batch(records: pd.DataFrame) -> np.ndarray:
+    feature_frame = build_model_input_frame(records)
+    scaled_data = scaler.transform(feature_frame)
+    prediction = model.predict(scaled_data, verbose=0).reshape(-1)
+    return prediction
+
 #SEARCH THROUGH UPDATED RECORDS################################
 def _search_update_df(df: pd.DataFrame, customer_id: str) -> dict[str, Any] | None:
     df_rev = df.iloc[::-1]
@@ -438,6 +467,82 @@ def build_insights(customer_data: dict[str, Any], probability: float) -> list[st
     else:
         insights.append("current profile looks comparatively stable")
     return insights[:4]
+
+
+def get_learning_state_signature() -> str:
+    state = load_learning_state()
+    return json.dumps(state, sort_keys=True)
+
+
+@st.cache_data(show_spinner=False)
+def get_safe_high_churn_customer_candidates(state_signature: str) -> pd.DataFrame:
+    del state_signature
+    state = load_learning_state()
+    retained_mean = pd.Series(state["retained_mean"], dtype=float)
+
+    scored_df = customer_df.copy()
+    scored_df["predicted_churn"] = predict_churn_batch(scored_df)
+    high_df = scored_df[scored_df["predicted_churn"] >= 0.8].copy().reset_index(drop=True)
+    if high_df.empty:
+        return pd.DataFrame(columns=["CustomerId", "predicted_churn", "best_simulated_churn", "best_offer_key"])
+
+    candidate_rows: list[pd.Series] = []
+    candidate_meta: list[tuple[str, float, str]] = []
+
+    for _, row in high_df.iterrows():
+        current_rec = customer_to_learning_vector(row.to_dict())
+        available_offer_names = [
+            offer_name
+            for offer_name in OFFER_LIBRARY
+            if not (float(row["CreditScore"]) >= 650 and offer_name == "advisor_callback")
+        ]
+        candidate_sets: list[tuple[str, ...]] = [(offer_name,) for offer_name in available_offer_names]
+        candidate_sets.extend(combinations(available_offer_names, 2))
+
+        for offer_set in candidate_sets:
+            temp_offer = {
+                offer_name: float(1.0 / (rank + 1))
+                for rank, offer_name in enumerate(offer_set)
+            }
+            simulated_rec = simulate_post_offer_record(
+                current_rec,
+                retained_mean,
+                temp_offer,
+                True,
+                state,
+            )
+            candidate_row = row.copy()
+            candidate_row["Balance"] = float(simulated_rec["Balance"])
+            candidate_row["NumOfProducts"] = int(round(float(simulated_rec["NumOfProducts"])))
+            candidate_row["HasCrCard"] = int(round(float(simulated_rec["HasCrCard"])))
+            candidate_row["IsActiveMember"] = int(round(float(simulated_rec["IsActiveMember"])))
+            candidate_rows.append(candidate_row)
+            candidate_meta.append((str(row["CustomerId"]), float(row["predicted_churn"]), "+".join(offer_set)))
+
+    candidate_df = pd.DataFrame(candidate_rows)
+    simulated_predictions = predict_churn_batch(candidate_df)
+
+    best_by_customer: dict[str, tuple[float, float, str]] = {}
+    for (customer_id, baseline_churn, offer_key), simulated_churn in zip(candidate_meta, simulated_predictions):
+        if float(simulated_churn) >= float(baseline_churn - SAFE_CHURN_MARGIN):
+            continue
+        previous = best_by_customer.get(customer_id)
+        if previous is None or float(simulated_churn) < previous[1]:
+            best_by_customer[customer_id] = (baseline_churn, float(simulated_churn), offer_key)
+
+    safe_rows = [
+        {
+            "CustomerId": customer_id,
+            "predicted_churn": baseline_churn,
+            "best_simulated_churn": best_simulated_churn,
+            "best_offer_key": offer_key,
+        }
+        for customer_id, (baseline_churn, best_simulated_churn, offer_key) in best_by_customer.items()
+    ]
+    result = pd.DataFrame(safe_rows)
+    if result.empty:
+        return result
+    return result.sort_values(["predicted_churn", "CustomerId"]).reset_index(drop=True)
 
 #USED WHEN API DOESN'T WORK IN BACKEND #
 def create_offer_text(
@@ -762,59 +867,131 @@ def give_offer(
             else:
                 history_penalty[offer_name] += 0.3
 
-    offer_scores = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
-    for feature in selected_features:
-        for offer_name, weight in state["offer_weights"][feature].items():
-            base = selected_feature_scores[feature] * float(weight)
-            # Here history offer is influencing offer scores
-            offer_scores[offer_name] += (
-                base
-                + history_bonus.get(offer_name, 0.0)
-                - history_penalty.get(offer_name, 0.0)
-            )
-
-    if float(customer_data["CreditScore"]) >= 650:
-        offer_scores.pop("advisor_callback", None)
-
     blocked_offers = excluded_offers or set()
-    available_offer = {
-        offer_name: score
-        for offer_name, score in offer_scores.items()
+    available_offer_names = [
+        offer_name
+        for offer_name in OFFER_LIBRARY
         if offer_name not in blocked_offers
-    }
-    if not available_offer:
-        available_offer = offer_scores
+        and not (float(customer_data["CreditScore"]) >= 650 and offer_name == "advisor_callback")
+    ]
+    if not available_offer_names:
+        available_offer_names = [
+            offer_name
+            for offer_name in OFFER_LIBRARY
+            if not (float(customer_data["CreditScore"]) >= 650 and offer_name == "advisor_callback")
+        ]
 
-    # Making offer scores into probability for selecting 2 of them
-    available_offer_probabilities = softmax_dict(available_offer)
-    ranked_offers = sorted(
-        available_offer_probabilities,
-        key=lambda offer_name: available_offer_probabilities[offer_name],
-        reverse=True,
+    offer_scores = {offer_name: 0.0 for offer_name in OFFER_LIBRARY}
+    offer_candidates: list[dict[str, Any]] = []
+    candidate_sets: list[tuple[str, ...]] = [(offer_name,) for offer_name in available_offer_names]
+    candidate_sets.extend(combinations(available_offer_names, 2))
+
+    for offer_set in candidate_sets:
+        temp_offer = {
+            offer_name: float(1.0 / (rank + 1))
+            for rank, offer_name in enumerate(offer_set)
+        }
+        simulated_rec = simulate_post_offer_record(
+            current_rec,
+            retained_mean,
+            temp_offer,
+            True,
+            state,
+        )
+        simulated_churn = predict_churn_(customer_data, simulated_rec)
+        churn_delta = float(simulated_churn - churn_rate)
+        history_adjustment = sum(
+            history_bonus.get(offer_name, 0.0) - history_penalty.get(offer_name, 0.0)
+            for offer_name in offer_set
+        )
+        movement_penalty = 0.01 * float((simulated_rec - current_rec).abs().sum())
+        raw_score = (-float(simulated_churn)) + history_adjustment - movement_penalty
+        improves_churn = float(simulated_churn) < float(churn_rate - SAFE_CHURN_MARGIN)
+
+        for offer_name in offer_set:
+            offer_scores[offer_name] = max(float(offer_scores.get(offer_name, -1e9)), raw_score)
+
+        offer_candidates.append(
+            {
+                "offer_names": list(offer_set),
+                "candidate_label": " + ".join(OFFER_LIBRARY[offer_name] for offer_name in offer_set),
+                "offer_weights": temp_offer,
+                "simulated_churn": float(simulated_churn),
+                "churn_delta": churn_delta,
+                "score": float(raw_score),
+                "history_adjustment": float(history_adjustment),
+                "movement_penalty": float(movement_penalty),
+                "improves_churn": bool(improves_churn),
+            }
+        )
+
+    ranked_candidates = [
+        candidate for candidate in offer_candidates if bool(candidate["improves_churn"])
+    ]
+    ranked_candidates = sorted(
+        ranked_candidates,
+        key=lambda candidate: (
+            float(candidate["simulated_churn"]),
+            -float(candidate["history_adjustment"]),
+            len(candidate["offer_names"]),
+            str(candidate["candidate_label"]),
+        ),
     )
-    top_offer_pool = ranked_offers[: min(3, len(ranked_offers))]
-    selection_size = min(2, len(top_offer_pool))
-    # top_offer_probabilities = softmax_dict(
-    #     {offer_name: float(available_offer[offer_name]) for offer_name in top_offer_pool}
-    # )
-    
-    # Here also safe_selection is used to select offers(before it was used for feature selection also)
-    chosen_offers, offers_importance = safe_selection(
-        items=top_offer_pool,
-        scores=available_offer,
-        k=selection_size,
-        rng=RNG,
+
+    all_ranked_candidates = sorted(
+        offer_candidates,
+        key=lambda candidate: (
+            not bool(candidate["improves_churn"]),
+            float(candidate["simulated_churn"]),
+            -float(candidate["history_adjustment"]),
+            len(candidate["offer_names"]),
+            str(candidate["candidate_label"]),
+        ),
     )
-    chosen_offer_scores = {offer_name: float(available_offer[offer_name]) for offer_name in chosen_offers}
+    ranking_score_map = {
+        str(index): float(candidate["score"])
+        for index, candidate in enumerate(all_ranked_candidates)
+    }
+    available_offer_probabilities = softmax_dict(ranking_score_map)
     offer_rankings = [
         {
-            "offer_name": offer_name,
-            "label": OFFER_LIBRARY[offer_name],
-            "score": float(available_offer[offer_name]),
-            "probability": float(available_offer_probabilities[offer_name]),
+            "offer_name": " + ".join(candidate["offer_names"]),
+            "label": str(candidate["candidate_label"]),
+            "score": float(candidate["score"]),
+            "probability": float(available_offer_probabilities.get(str(index), 0.0)),
+            "simulated_churn": float(candidate["simulated_churn"]),
+            "churn_delta": float(candidate["churn_delta"]),
+            "improves_churn": bool(candidate["improves_churn"]),
+            "offer_names": list(candidate["offer_names"]),
         }
-        for offer_name in ranked_offers
+        for index, candidate in enumerate(all_ranked_candidates)
     ]
+
+    if not ranked_candidates:
+        return {
+            "selected_features": selected_features,
+            "selected_feature_scores": selected_feature_scores,
+            "offers_importance": {},
+            "offer_scores": {},
+            "offer_rankings": offer_rankings,
+            "offer_string": (
+                "No safe automated offer is available for this customer right now. "
+                "All evaluated offers increased predicted churn, so escalate to advisor review."
+            ),
+            "offer_labels": [],
+            "current_rec": serialize_series(current_rec),
+            "no_safe_offer": True,
+        }
+
+    chosen_candidate = ranked_candidates[0]
+    offers_importance = {
+        str(offer_name): float(weight)
+        for offer_name, weight in chosen_candidate["offer_weights"].items()
+    }
+    chosen_offer_scores = {
+        str(offer_name): float(offer_scores.get(offer_name, 0.0))
+        for offer_name in chosen_candidate["offer_names"]
+    }
 
     #This offer string will be used if LLM doesn't work properly to generate text
     offer_string = generate_offer_text(
@@ -834,6 +1011,7 @@ def give_offer(
         "offer_string": offer_string,
         "offer_labels": [OFFER_LIBRARY[offer_name] for offer_name in offers_importance],
         "current_rec": serialize_series(current_rec),
+        "no_safe_offer": False,
     }
 
 
@@ -852,28 +1030,32 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
     # offer_payload gets offers selected with their probabilities and scores
     offer_payload = give_offer(customer_data, probability, state)
 
-    # Here offer is sent and observe change in customer behaviour(acceptence and feedback)
-    # When accepted/Not accepted and feedback is submitted it removes from observation
-    store_in_observation(
-        customer_id,
-        {
-            "customer_id": customer_id,
-            "pre_rec": offer_payload["current_rec"],
-            "pre_churn": float(probability),
-            "offer_given": offer_payload["offers_importance"],
-            "offer_string": offer_payload["offer_string"],
-            "selected_features": offer_payload["selected_features"],
-            "offer_attempt": 1,
-            "customer_query": customer_query,
-            "created_at": datetime.utcnow().isoformat(),
-        },
-    )
+    if not offer_payload.get("no_safe_offer", False):
+        # Here offer is sent and observe change in customer behaviour(acceptence and feedback)
+        # When accepted/Not accepted and feedback is submitted it removes from observation
+        store_in_observation(
+            customer_id,
+            {
+                "customer_id": customer_id,
+                "pre_rec": offer_payload["current_rec"],
+                "pre_churn": float(probability),
+                "offer_given": offer_payload["offers_importance"],
+                "offer_string": offer_payload["offer_string"],
+                "selected_features": offer_payload["selected_features"],
+                "offer_attempt": 1,
+                "customer_query": customer_query,
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        )
 
     # this string is used when LLM is not working
     recommended_actions = [offer_payload["offer_string"]]
-    recommended_actions.extend(
-        f"Prioritize {feature} improvement for this customer." for feature in offer_payload["selected_features"]
-    )
+    if offer_payload.get("no_safe_offer", False):
+        recommended_actions.append("Review the customer manually instead of sending an automated retention offer.")
+    else:
+        recommended_actions.extend(
+            f"Prioritize {feature} improvement for this customer." for feature in offer_payload["selected_features"]
+        )
     return {
         "customer_id": customer_id,
         "customer_query": customer_query,
@@ -894,7 +1076,7 @@ def analyze_customer(customer_id: str, customer_query: str) -> dict[str, Any]:
             "feedback_reason": "",
             "replacement_generated": False,
             "replacement_limit_reached": False,
-            "interaction_complete": False,
+            "interaction_complete": bool(offer_payload.get("no_safe_offer", False)),
             "offer_attempt": 1,
         },
     }
@@ -978,43 +1160,71 @@ def process_feedback(
             excluded_offers=set(offer_given),# here the very next offer is not containing same offer(this avoids repetative offer to customer) but it may include offers in next-to-next offers
             previous_one_rejected=1,
         )
-        store_in_observation(
-            customer_id,
-            {
-                "customer_id": customer_id,
-                "pre_rec": replacement_offer["current_rec"],
-                "pre_churn": float(current_churn),
-                "offer_given": replacement_offer["offers_importance"],
-                "offer_string": replacement_offer["offer_string"],
+        if replacement_offer.get("no_safe_offer", False):
+            latest_result["recommended_actions"] = [replacement_offer["offer_string"]]
+            latest_result["recommended_actions"].append(
+                "Stop automated offers for this interaction and escalate to advisor review."
+            )
+            latest_result["offer_context"] = {
                 "selected_features": replacement_offer["selected_features"],
+                "selected_feature_scores": replacement_offer["selected_feature_scores"],
+                "offers_importance": replacement_offer["offers_importance"],
+                "offer_scores": replacement_offer["offer_scores"],
+                "offer_rankings": replacement_offer["offer_rankings"],
+                "offer_labels": replacement_offer["offer_labels"],
+                "previous_one_rejected": 1,
+                "replacement_limit_reached": True,
+                "no_safe_offer": True,
+            }
+            latest_result["feedback_status"] = {
+                "accepted_offer": False,
+                "feedback_reason": feedback_reason,
+                "replacement_generated": False,
+                "replacement_limit_reached": True,
+                "interaction_complete": True,
+                "offer_attempt": offer_attempt,
+                "rejected_offer": observation["offer_string"],
+                "rejected_offer_keys": list(offer_given),
+            }
+        else:
+            store_in_observation(
+                customer_id,
+                {
+                    "customer_id": customer_id,
+                    "pre_rec": replacement_offer["current_rec"],
+                    "pre_churn": float(current_churn),
+                    "offer_given": replacement_offer["offers_importance"],
+                    "offer_string": replacement_offer["offer_string"],
+                    "selected_features": replacement_offer["selected_features"],
+                    "offer_attempt": 2,
+                    "customer_query": latest_result.get("customer_query", ""),
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+            latest_result["recommended_actions"] = [replacement_offer["offer_string"]]
+            latest_result["recommended_actions"].extend(
+                f"Follow up through {label}." for label in replacement_offer["offer_labels"]
+            )
+            latest_result["offer_context"] = {
+                "selected_features": replacement_offer["selected_features"],
+                "selected_feature_scores": replacement_offer["selected_feature_scores"],
+                "offers_importance": replacement_offer["offers_importance"],
+                "offer_scores": replacement_offer["offer_scores"],
+                "offer_rankings": replacement_offer["offer_rankings"],
+                "offer_labels": replacement_offer["offer_labels"],
+                "previous_one_rejected": 1,
+                "no_safe_offer": False,
+            }
+            latest_result["feedback_status"] = {
+                "accepted_offer": False,
+                "feedback_reason": feedback_reason,
+                "replacement_generated": True,
+                "replacement_limit_reached": False,
+                "interaction_complete": False,
                 "offer_attempt": 2,
-                "customer_query": latest_result.get("customer_query", ""),
-                "created_at": datetime.utcnow().isoformat(),
-            },
-        )
-        latest_result["recommended_actions"] = [replacement_offer["offer_string"]]# Reset to new offers
-        latest_result["recommended_actions"].extend( # New recommended actions
-            f"Follow up through {label}." for label in replacement_offer["offer_labels"]
-        )
-        latest_result["offer_context"] = {
-            "selected_features": replacement_offer["selected_features"],
-            "selected_feature_scores": replacement_offer["selected_feature_scores"],
-            "offers_importance": replacement_offer["offers_importance"],
-            "offer_scores": replacement_offer["offer_scores"],
-            "offer_rankings": replacement_offer["offer_rankings"],
-            "offer_labels": replacement_offer["offer_labels"],
-            "previous_one_rejected": 1,
-        }
-        latest_result["feedback_status"] = {
-            "accepted_offer": False,
-            "feedback_reason": feedback_reason,
-            "replacement_generated": True,
-            "replacement_limit_reached": False,
-            "interaction_complete": False,
-            "offer_attempt": 2,
-            "rejected_offer": observation["offer_string"],
-            "rejected_offer_keys": list(offer_given),
-        }
+                "rejected_offer": observation["offer_string"],
+                "rejected_offer_keys": list(offer_given),
+            }
     elif not accepted_offer:
         latest_result["recommended_actions"] = [
             "Replacement offer was rejected. Stop automated offers for this interaction and escalate to advisor review."
@@ -1292,7 +1502,21 @@ def render_learning_agent_ui() -> None:
         st.write("Use a `CustomerId` from `Churn_Modelling.csv`, for example `15634602`.")
 
         with st.form("existing_customer_form"):
-            customer_ids = sorted(customer_df["CustomerId"].astype(str).unique())
+            state_signature = get_learning_state_signature()
+            safe_high_churn_df = get_safe_high_churn_customer_candidates(state_signature)
+            customer_pool = st.radio(
+                "Customer Pool",
+                ["All customers", "High churn with safe offer"],
+                horizontal=True,
+                help="Use the filtered pool to test customers where the current model finds at least one safe automated offer.",
+            )
+            if customer_pool == "High churn with safe offer" and not safe_high_churn_df.empty:
+                customer_ids = safe_high_churn_df["CustomerId"].astype(str).tolist()
+                st.caption(f"{len(customer_ids)} high-churn customers currently pass the safe-offer gate.")
+            else:
+                customer_ids = sorted(customer_df["CustomerId"].astype(str).unique())
+                if customer_pool == "High churn with safe offer":
+                    st.caption("No high-churn customers currently pass the safe-offer gate. Showing the full customer list instead.")
             customer_id = st.selectbox("Customer ID", customer_ids, index=0)
             customer_query = st.text_area(
                 "Agent Query",
